@@ -32,7 +32,7 @@ from skimage.color import rgb2gray
 
 # Zona de cautare a pleurei, in mm de la partea de sus a imaginii cropate
 DEPTH_MIN_MM = 15.0       # pleura e rareori mai sus de 1.5 cm
-DEPTH_MAX_MM = 55.0       # nici mai jos de ~5.5 cm la adult normostenic
+DEPTH_MAX_MM = 40.0       # limita superioara — empirica, din histograma
 
 # Fereastra de analiza pentru umbra acustica (in mm, sub candidat)
 SHADOW_OFFSET_MM = 3.0    # buffer imediat dedesubt (skip zona de reverberatie)
@@ -44,8 +44,8 @@ PEAK_MIN_DISTANCE_PX = 8  # distanta minima intre varfuri
 
 # RANSAC
 RANSAC_POLY_DEGREE = 2
-RANSAC_THRESH_PX = 15
-RANSAC_ITERATIONS = 200
+RANSAC_THRESH_PX = 10     # mai strict — reduce imprastierea inlierilor
+RANSAC_ITERATIONS = 300   # mai multe iteratii pt stabilitate
 RANSAC_MIN_INLIERS_FRAC = 0.3
 
 
@@ -218,30 +218,44 @@ def PixelConverter(orig_Image):
 
     depth = None
 
-    if 'cm' in image_str:
-        depth_str = image_str[image_str.find('cm') - 5:image_str.find('cm')]
-        depth_no = [int(i) for i in depth_str if i.isdigit()]
-        if depth_no:
-            depth = depth_no[0] * 10  # cm → mm
-            print(f"[PixelConverter] Adancime gasita prin 'cm': {depth} mm")
+    # Prioritate 1: formatul standard '-D 45' sau '\nD 45' (adancime ecograf)
+    # Acestea sunt cele mai fiabile — formatul specific al ecografelor GE/Philips/etc.
+    for token in ('-D ', '\nD '):
+        if token in image_str:
+            i0 = image_str.find(token) + len(token)
+            # Extrage primul numar INTREG dupa token (nu cifre individuale)
+            remaining = image_str[i0:i0 + 10]
+            match = re.search(r'\d+', remaining)
+            if match:
+                val = int(match.group())
+                # Heuristic: valori 15-200 sunt plauzibile ca mm (adancime ecograf)
+                # Valori 1-14 sunt probabil cm (converteste la mm)
+                if val <= 14:
+                    depth = val * 10  # cm → mm
+                else:
+                    depth = val  # deja mm
+                print(f"[PixelConverter] Adancime gasita prin '{token.strip()}': {depth} mm (val citit: {val})")
+                break
 
-    if 'mm' in image_str and depth is None:
-        depth_str = image_str[image_str.find('mm') - 5:image_str.find('mm')]
-        depth_no = [int(s) for s in re.findall(r'\b\d+\b', depth_str)]
-        if depth_no:
-            depth = depth_no[0]
-            print(f"[PixelConverter] Adancime gasita prin 'mm': {depth} mm")
+    # Prioritate 2: 'cm' / 'mm' dar DOAR daca nu e precedat de '.' sau 'L '
+    # (evita prinderea '1L 0.56 cm' care e lungime masurata, nu adancime)
+    if depth is None and 'cm' in image_str:
+        idx_cm = image_str.find('cm')
+        before = image_str[max(0, idx_cm - 8):idx_cm]
+        if '.' not in before and 'L ' not in before:
+            depth_no = [int(s) for s in re.findall(r'\b\d+\b', before)]
+            if depth_no:
+                depth = depth_no[0] * 10
+                print(f"[PixelConverter] Adancime gasita prin 'cm': {depth} mm")
 
-    if depth is None:
-        for token in ('\nD ', '-D '):
-            if token in image_str:
-                i0 = image_str.find(token)
-                depth_str = image_str[i0:i0 + 6]
-                depth_no = [int(i) for i in depth_str if i.isdigit()]
-                if depth_no:
-                    depth = depth_no[0] * 10 if depth_no[0] < 50 else depth_no[0]
-                    print(f"[PixelConverter] Adancime gasita prin '{token.strip()}': {depth} mm")
-                    break
+    if depth is None and 'mm' in image_str:
+        idx_mm = image_str.find('mm')
+        before = image_str[max(0, idx_mm - 8):idx_mm]
+        if '.' not in before and 'L ' not in before:
+            depth_no = [int(s) for s in re.findall(r'\b\d+\b', before)]
+            if depth_no:
+                depth = depth_no[0]
+                print(f"[PixelConverter] Adancime gasita prin 'mm': {depth} mm")
 
     if depth is None:
         print('[PixelConverter] AVERTISMENT: adancime negasita prin OCR!')
@@ -443,8 +457,24 @@ def ExtractPleuralLine(crop_image, one_pixel_mm, debug=False, debug_columns=None
         ys_med = medfilt(ys_inlier, kernel_size=5) if len(ys_inlier) >= 5 else ys_inlier
         try:
             spline = UnivariateSpline(xs_inlier, ys_med, k=3, s=len(xs_inlier))
-            x_full = np.arange(xs_inlier.min(), xs_inlier.max() + 1)
-            pleura_y_smooth[x_full] = spline(x_full)
+            # Acopera DOAR coloanele cu inlieri reali in apropiere (max 30 px gap)
+            # Evita extrapolarea in zonele fara suport (ex: capetele imaginii)
+            x_min, x_max = xs_inlier.min(), xs_inlier.max()
+            x_full = np.arange(x_min, x_max + 1)
+            y_full = spline(x_full)
+
+            # Constrange y_full sa nu iasa din range-ul inlierilor (+-10 px toleranta)
+            y_lo = ys_inlier.min() - 10
+            y_hi = ys_inlier.max() + 10
+            mask_reasonable = (y_full >= y_lo) & (y_full <= y_hi)
+
+            valid_x = x_full[mask_reasonable]
+            valid_y = y_full[mask_reasonable]
+            pleura_y_smooth[valid_x] = valid_y
+
+            n_rejected = (~mask_reasonable).sum()
+            if n_rejected > 0:
+                print(f"[ExtractPleuralLine] Spline respins pt {n_rejected} coloane (extrapolare prea mare)")
         except Exception as e:
             print(f"[ExtractPleuralLine] Spline esuat ({e}), folosesc interpolare liniara.")
             x_full = np.arange(W)
@@ -584,6 +614,80 @@ def _debug_plot(crop_image, enhanced, pleura_y, pleura_y_smooth,
 #  MAIN
 # ═════════════════════════════════════════════════════════════
 
+def plot_on_image(result, img_denoised, one_pixel, save_path=None):
+    """
+    Afiseaza imaginea CU linia pleurala suprapusa pentru verificare vizuala LOCALA.
+
+    ATENTIE: afiseaza imaginea originala — foloseste doar pentru debug local,
+    nu trimite screenshot-urile nimanui daca sunt sub NDA.
+
+    Daca save_path e dat, salveaza figura pe disc in loc sa o afiseze.
+    """
+    pleura_y = result['pleura_y']
+    pleura_smooth = result['pleura_y_smooth']
+    inlier_mask = result['inlier_mask']
+    enhanced = result['enhanced']
+    H, W = img_denoised.shape
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+
+    # Rand 1: imaginea denoised + linia finala
+    ax = axes[0]
+    ax.imshow(img_denoised, cmap='gray')
+
+    xs = np.arange(W)
+
+    # Detectii brute (rosu, mic)
+    valid_raw = ~np.isnan(pleura_y)
+    ax.scatter(xs[valid_raw], pleura_y[valid_raw], s=2, c='red', alpha=0.4,
+               label=f'Detectii brute ({valid_raw.sum()})')
+
+    # Inlieri RANSAC (portocaliu)
+    ax.scatter(xs[inlier_mask], pleura_y[inlier_mask], s=4, c='orange', alpha=0.7,
+               label=f'Inlieri RANSAC ({inlier_mask.sum()})')
+
+    # Linia finala (verde)
+    valid_smooth = ~np.isnan(pleura_smooth)
+    ax.plot(xs[valid_smooth], pleura_smooth[valid_smooth], 'lime', linewidth=2,
+            label=f'Pleura (smooth, {valid_smooth.sum()} col)')
+
+    # Zona de cautare
+    y_min_px = _mm_to_px(DEPTH_MIN_MM, one_pixel)
+    y_max_px = _mm_to_px(DEPTH_MAX_MM, one_pixel)
+    ax.axhline(y=y_min_px, color='cyan', linestyle='--', alpha=0.5,
+               label=f'Zona cautare [{y_min_px}-{y_max_px} px]')
+    ax.axhline(y=y_max_px, color='cyan', linestyle='--', alpha=0.5)
+
+    ax.set_title(f'Pleura detectata peste imaginea denoised — '
+                 f'confidence={result["confidence"]:.2f}')
+    ax.legend(loc='upper right', fontsize=9)
+    ax.set_xlabel('x (px)')
+    ax.set_ylabel('y (px)')
+
+    # Rand 2: imaginea dupa CLAHE + linia
+    ax = axes[1]
+    ax.imshow(enhanced, cmap='gray')
+    ax.plot(xs[valid_smooth], pleura_smooth[valid_smooth], 'lime', linewidth=2)
+    ax.scatter(xs[inlier_mask], pleura_y[inlier_mask], s=4, c='orange', alpha=0.6)
+    ax.axhline(y=y_min_px, color='cyan', linestyle='--', alpha=0.4)
+    ax.axhline(y=y_max_px, color='cyan', linestyle='--', alpha=0.4)
+    ax.set_title('Imagine dupa CLAHE (aceeasi linie)')
+    ax.set_xlabel('x (px)')
+    ax.set_ylabel('y (px)')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=100, bbox_inches='tight')
+        print(f"[plot_on_image] Salvat in: {save_path}")
+        plt.close()
+    else:
+        # block=True (default) — programul asteapta aici pana inchizi
+        # ambele ferestre. Prima fereastra e deja deschisa (block=False).
+        print("\n[plot_on_image] Inchide AMBELE ferestre ca sa termine programul.")
+        plt.show()
+
+
 def main():
     orig_Image = io.imread('./ORIGINAL_IMAGES/1.jpg')
 
@@ -591,20 +695,199 @@ def main():
     print(f"Un pixel = {one_pixel:.4f} mm")
 
     # Safety: daca OCR-ul a esuat, foloseste o valoare hardcodata
-    # Ajusteaza aceasta valoare daca stii rezolutia exacta a ecografiilor tale
     if one_pixel <= 0 or one_pixel > 0.5:
         print("\n[main] PixelConverter a dat o valoare suspecta. Folosesc fallback.")
-        one_pixel = 0.07  # ~0.07 mm/px tipic pentru ecografia pulmonara
+        one_pixel = 0.07
         print(f"[main] Folosesc one_pixel = {one_pixel} mm/px (hardcodat)\n")
 
     crop_image = CropBorder(orig_Image)
     img_denoised = remove_noise(crop_image)
 
-    result = ExtractPleuralLine(img_denoised, one_pixel, debug=True)
+    result = ExtractPleuralLine(img_denoised, one_pixel, debug=False)
 
-    print(f"Confidence: {result['confidence']:.2f}")
-    print(f"Inlieri:    {result['inlier_mask'].sum()} / {len(result['pleura_y'])}")
-    print(f"Contur:     {result['contour'].shape}")
+    # Raport numeric + grafice abstracte (fara imagine) — pt partajat
+    print_debug_report(result, img_denoised, one_pixel)
+
+    # Plot pe imagine — DOAR pentru verificare locala (NDA-safe)
+    plot_on_image(result, img_denoised, one_pixel)
+
+
+def print_debug_report(result, img_denoised, one_pixel):
+    """
+    Afiseaza raport complet de debug FARA a afisa imaginea (pt date sub NDA).
+    Include: statistici numerice + grafice abstracte (histograme, distributii).
+    """
+    pleura_y = result['pleura_y']
+    pleura_smooth = result['pleura_y_smooth']
+    scores = result['scores']
+    inlier_mask = result['inlier_mask']
+    enhanced = result['enhanced']
+    H, W = img_denoised.shape
+
+    # ═══════════════════════════════════════════════════════
+    #  RAPORT NUMERIC
+    # ═══════════════════════════════════════════════════════
+
+    print("\n" + "═" * 60)
+    print("  RAPORT DEBUG — ExtractPleuralLine (date anonime)")
+    print("═" * 60)
+
+    print(f"\n[Dimensiuni]")
+    print(f"  Imagine: {W} x {H} px")
+    print(f"  Rezolutie: {one_pixel:.4f} mm/px")
+    print(f"  Zona cautare: {_mm_to_px(DEPTH_MIN_MM, one_pixel)}-{_mm_to_px(DEPTH_MAX_MM, one_pixel)} px "
+          f"({DEPTH_MIN_MM}-{DEPTH_MAX_MM} mm)")
+
+    # Statistici detectie bruta
+    valid_raw = ~np.isnan(pleura_y)
+    n_valid_raw = valid_raw.sum()
+    print(f"\n[Detectie bruta (inainte de RANSAC)]")
+    print(f"  Coloane cu varf candidat: {n_valid_raw} / {W} ({100*n_valid_raw/W:.1f}%)")
+    if n_valid_raw > 0:
+        print(f"  y detectat — min: {np.nanmin(pleura_y):.0f} px, "
+              f"max: {np.nanmax(pleura_y):.0f} px, "
+              f"median: {np.nanmedian(pleura_y):.0f} px")
+        print(f"  y detectat — std: {np.nanstd(pleura_y):.1f} px "
+              f"(imprastiere; <30 e bine, >60 inseamna zgomot)")
+
+    # Statistici inlieri RANSAC
+    n_inliers = inlier_mask.sum()
+    print(f"\n[Dupa RANSAC]")
+    print(f"  Inlieri: {n_inliers} / {W} ({100*n_inliers/W:.1f}%)")
+    if n_inliers > 0:
+        ys_in = pleura_y[inlier_mask]
+        print(f"  y inlieri — median: {np.median(ys_in):.0f} px, "
+              f"std: {np.std(ys_in):.1f} px")
+        # Grosime banda de inlieri (ideal e subtire)
+        iqr = np.percentile(ys_in, 75) - np.percentile(ys_in, 25)
+        print(f"  y inlieri — IQR: {iqr:.0f} px (<15 e bine, sugereaza linie coerenta)")
+
+    # Statistici finale smooth
+    valid_smooth = ~np.isnan(pleura_smooth)
+    n_smooth = valid_smooth.sum()
+    print(f"\n[Linia finala (dupa spline)]")
+    print(f"  Coloane acoperite: {n_smooth} / {W} ({100*n_smooth/W:.1f}%)")
+    if n_smooth > 0:
+        print(f"  y smooth — min: {np.nanmin(pleura_smooth):.0f} px, "
+              f"max: {np.nanmax(pleura_smooth):.0f} px")
+        print(f"  Amplitudine verticala: {np.nanmax(pleura_smooth) - np.nanmin(pleura_smooth):.0f} px")
+
+    # Statistici scoruri
+    valid_scores = scores[scores > -np.inf]
+    if len(valid_scores) > 0:
+        print(f"\n[Scoruri umbra acustica]")
+        print(f"  Media (toti): {valid_scores.mean():.3f}")
+        print(f"  Media (inlieri): {scores[inlier_mask].mean():.3f}" if n_inliers > 0 else "  (niciun inlier)")
+        print(f"  Min / Max: {valid_scores.min():.3f} / {valid_scores.max():.3f}")
+        print(f"  Interpretare: >0.2 = umbra clara, 0.1-0.2 = moderata, <0.1 = slaba")
+
+    print(f"\n[Scor final]")
+    print(f"  Confidence: {result['confidence']:.2f}")
+    print(f"  Contur OpenCV: {result['contour'].shape}")
+
+    # Diagnostic automat
+    print(f"\n[Diagnostic automat]")
+    if n_inliers < W * 0.3:
+        print(f"  ⚠ Prea putini inlieri ({100*n_inliers/W:.0f}%) — poate ajusta DEPTH_MIN/MAX_MM")
+    if n_valid_raw > 0 and np.nanstd(pleura_y) > 60:
+        print(f"  ⚠ Imprastiere mare a detectiilor brute — zgomot sau fascie puternica")
+    if valid_scores.mean() < 0.1 if len(valid_scores) > 0 else False:
+        print(f"  ⚠ Scoruri umbra mici — poate mari SHADOW_WINDOW_MM sau scade PEAK_PROMINENCE")
+    if n_inliers >= W * 0.5 and result['confidence'] > 0.5:
+        print(f"  ✓ Detectie buna")
+
+    print("═" * 60 + "\n")
+
+    # ═══════════════════════════════════════════════════════
+    #  GRAFICE ABSTRACTE (NU CONTIN IMAGINEA)
+    # ═══════════════════════════════════════════════════════
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+
+    # 1. Histograma pozitiilor y detectate (bruta vs inlieri)
+    ax = axes[0, 0]
+    if valid_raw.sum() > 0:
+        ax.hist(pleura_y[valid_raw], bins=50, alpha=0.5,
+                label=f'Brute (n={valid_raw.sum()})', color='red')
+    if inlier_mask.sum() > 0:
+        ax.hist(pleura_y[inlier_mask], bins=50, alpha=0.7,
+                label=f'Inlieri RANSAC (n={inlier_mask.sum()})', color='orange')
+    ax.axvline(_mm_to_px(DEPTH_MIN_MM, one_pixel), color='cyan',
+               linestyle='--', label='Limite cautare')
+    ax.axvline(_mm_to_px(DEPTH_MAX_MM, one_pixel), color='cyan', linestyle='--')
+    ax.set_xlabel('y (px) — adancime in imagine')
+    ax.set_ylabel('Numar coloane')
+    ax.set_title('Distributia pozitiilor y detectate')
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    # 2. Histograma scorurilor de umbra acustica
+    ax = axes[0, 1]
+    if len(valid_scores) > 0:
+        ax.hist(valid_scores, bins=40, alpha=0.5,
+                label='Toate detectiile', color='blue')
+    if inlier_mask.sum() > 0:
+        ax.hist(scores[inlier_mask], bins=40, alpha=0.7,
+                label='Doar inlieri', color='green')
+    ax.axvline(0.1, color='orange', linestyle='--', alpha=0.5, label='Prag "slab"')
+    ax.axvline(0.2, color='red', linestyle='--', alpha=0.5, label='Prag "clar"')
+    ax.set_xlabel('Scor umbra acustica (intensitate_varf - mu_sub)')
+    ax.set_ylabel('Numar coloane')
+    ax.set_title('Distributia scorurilor de umbra acustica')
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    # 3. y detectat vs coloana (profil "long axis")
+    ax = axes[1, 0]
+    xs = np.arange(W)
+    xs_raw = xs[valid_raw]
+    ax.scatter(xs_raw, pleura_y[valid_raw], s=3, alpha=0.3, color='red',
+               label=f'Brute ({valid_raw.sum()})')
+    xs_in = xs[inlier_mask]
+    ax.scatter(xs_in, pleura_y[inlier_mask], s=4, alpha=0.6, color='orange',
+               label=f'Inlieri ({inlier_mask.sum()})')
+    xs_sm = xs[valid_smooth]
+    ax.plot(xs_sm, pleura_smooth[valid_smooth], 'lime', linewidth=2,
+            label='Smooth final')
+    ax.axhline(_mm_to_px(DEPTH_MIN_MM, one_pixel), color='cyan',
+               linestyle='--', alpha=0.5)
+    ax.axhline(_mm_to_px(DEPTH_MAX_MM, one_pixel), color='cyan',
+               linestyle='--', alpha=0.5)
+    ax.invert_yaxis()
+    ax.set_xlabel('x (px) — coloana')
+    ax.set_ylabel('y (px) — adancime detectata')
+    ax.set_title('Pozitia pleurei pe latimea imaginii')
+    ax.legend()
+    ax.grid(alpha=0.3)
+
+    # 4. Profile intensitate 5 coloane (doar curbele, FARA imagine)
+    ax = axes[1, 1]
+    debug_cols = np.linspace(int(W * 0.15), int(W * 0.85), 5, dtype=int)
+    colors = plt.cm.viridis(np.linspace(0, 1, len(debug_cols)))
+    for col_x, c in zip(debug_cols, colors):
+        profile = enhanced[:, col_x]
+        ax.plot(profile, np.arange(H), color=c, linewidth=0.8,
+                label=f'x={col_x}')
+        # Marker pentru pozitia detectata
+        if not np.isnan(pleura_y[col_x]):
+            y_pk = int(pleura_y[col_x])
+            marker = 'o' if inlier_mask[col_x] else 'x'
+            ax.plot(profile[y_pk], y_pk, marker, color=c, markersize=10,
+                    markeredgecolor='black', markeredgewidth=1)
+    ax.axhspan(_mm_to_px(DEPTH_MIN_MM, one_pixel),
+               _mm_to_px(DEPTH_MAX_MM, one_pixel),
+               color='cyan', alpha=0.1, label='Zona cautare')
+    ax.invert_yaxis()
+    ax.set_xlabel('Intensitate (0-1)')
+    ax.set_ylabel('y (px)')
+    ax.set_title('Profile de intensitate pe 5 coloane (o=inlier, x=outlier)')
+    ax.legend(fontsize=8, loc='upper right')
+    ax.grid(alpha=0.3)
+
+    plt.suptitle(f'ExtractPleuralLine — Debug anonim (nu contine imaginea)',
+                 fontsize=13, y=0.995)
+    plt.tight_layout()
+    plt.show(block=False)  # NU blocheaza — permite deschiderea a doua figuri
 
 
 if __name__ == '__main__':
