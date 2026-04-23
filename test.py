@@ -42,11 +42,22 @@ SHADOW_WINDOW_MM = 15.0   # cat de mult masuram dedesubt
 PEAK_PROMINENCE = 0.08    # prominenta minima (pe scala [0,1])
 PEAK_MIN_DISTANCE_PX = 8  # distanta minima intre varfuri
 
-# RANSAC
+# RANSAC (folosit doar ca fallback daca DP esueaza)
 RANSAC_POLY_DEGREE = 2
-RANSAC_THRESH_PX = 10     # mai strict — reduce imprastierea inlierilor
-RANSAC_ITERATIONS = 300   # mai multe iteratii pt stabilitate
+RANSAC_THRESH_PX = 10
+RANSAC_ITERATIONS = 300
 RANSAC_MIN_INLIERS_FRAC = 0.3
+
+# Dynamic Programming (metoda principala de detectie)
+DP_LAMBDA = 0.3          # penalizare pt salt vertical (mai mare = linie mai "neteda")
+DP_MAX_JUMP_PX = 25      # saltul maxim permis intre coloane vecine (px)
+DP_MIN_SCORE_THRESH = 0.05  # scor minim pt o coloana sa fie "valida" dupa DP
+DP_MIN_VALID_FRAC = 0.4  # % minim coloane valide pt acceptarea caii DP
+
+# Contur pleura (extragere margini sus/jos + segmentare pe intreruperi)
+INTERRUPT_MIN_GAP_MM = 3.0   # gap ≥ 3mm = intrerupere reala (sub asta = zgomot)
+BAND_INTENSITY_FRAC = 0.75   # extinde banda cat timp I >= 75% din I(varf) — mai strict
+BAND_MAX_HALF_WIDTH_MM = 1.0 # grosime max jumatate banda (total max 2mm — fizic realist)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -378,77 +389,242 @@ def _ransac_poly(xs, ys, degree=2, thresh=15, iterations=200):
         return best_coefs, best_inliers
 
 
+# ─────────────────────────────────────────────────────────────
+#  DYNAMIC PROGRAMMING — cale optima prin imagine
+# ─────────────────────────────────────────────────────────────
+
+def _compute_cost_map(enhanced, y_min, y_max, shadow_offset_px, shadow_window_px):
+    """
+    Calculeaza hartea de cost pt DP. Pentru fiecare (x, y) in zona de cautare:
+      score(x, y) = I(x, y) - mean(I(x, y+offset : y+offset+window))
+      cost(x, y) = 1 - score_normalizat (cu cat e mai mare scorul, cu atat cost mai mic)
+
+    Returneaza:
+      cost_map  : np.array(H, W) — costuri in [0, 1], inf in zona invalida
+      score_map : np.array(H, W) — scorurile brute (pt raportare)
+    """
+    H, W = enhanced.shape
+    score_map = np.full((H, W), -np.inf, dtype=np.float32)
+
+    # Precalculeaza suma cumulativa pe coloane pt fereastra medie rapida
+    # csum[i, x] = suma enhanced[0:i, x]
+    csum = np.concatenate([np.zeros((1, W), dtype=np.float32),
+                            np.cumsum(enhanced, axis=0, dtype=np.float32)], axis=0)
+
+    # Pentru fiecare y din zona valida, calculeaza scorul simultan pe toate coloanele
+    for y in range(y_min, y_max + 1):
+        y_start = y + shadow_offset_px
+        y_end = y + shadow_offset_px + shadow_window_px
+        if y_end >= H:
+            continue
+
+        # Intensitatea la (y, all_x)
+        i_peak = enhanced[y, :]
+        # Media ferestrei de umbra pe fiecare coloana
+        window_sum = csum[y_end, :] - csum[y_start, :]
+        window_mean = window_sum / shadow_window_px
+
+        score_map[y, :] = i_peak - window_mean
+
+    # Transforma scor → cost. Valori mari scor = cost mic. Norm la [0, 1].
+    valid = score_map > -np.inf
+    if not valid.any():
+        return np.full_like(score_map, np.inf), score_map
+
+    s_min = score_map[valid].min()
+    s_max = score_map[valid].max()
+    s_range = max(s_max - s_min, 1e-6)
+
+    cost_map = np.full_like(score_map, np.inf, dtype=np.float32)
+    cost_map[valid] = 1.0 - (score_map[valid] - s_min) / s_range
+
+    return cost_map, score_map
+
+
+def _dp_optimal_path(cost_map, lambda_penalty, max_jump):
+    """
+    Dynamic Programming: gaseste calea optima (un y per coloana) minimizand:
+      sum_x [ cost(x, y_x) ] + lambda * sum_x [ |y_x - y_{x-1}| ]
+
+    Saltul vertical intre coloane vecine e limitat la max_jump px.
+
+    Returneaza:
+      path    : np.array(W,) coordonate y optime per coloana
+      dp_cost : np.array(W,) costul cumulativ pe calea optima (pt evaluare)
+    """
+    H, W = cost_map.shape
+
+    # Tabela DP: dp[y, x] = cost minim al caii optime pana la (x, y)
+    # NOTA: pastram aceeasi conventie ca cost_map (H, W) pentru usurinta indexarii
+    dp = np.full((H, W), np.inf, dtype=np.float32)
+    # Parent pointer: pt a reconstrui calea
+    parent = np.full((H, W), -1, dtype=np.int32)
+
+    # Prima coloana: cost initial = cost_local
+    dp[:, 0] = cost_map[:, 0]
+
+    # Forward pass
+    for x in range(1, W):
+        for y in range(H):
+            if cost_map[y, x] == np.inf:
+                continue
+
+            # Limite y_prev valide
+            y_lo = max(0, y - max_jump)
+            y_hi = min(H, y + max_jump + 1)
+
+            # Cost candidat pt fiecare y_prev
+            prev_costs = dp[y_lo:y_hi, x - 1]
+            transition = lambda_penalty * np.abs(np.arange(y_lo, y_hi) - y)
+            total = prev_costs + transition
+
+            best_idx = np.argmin(total)
+            best_cost = total[best_idx]
+
+            if best_cost < np.inf:
+                dp[y, x] = cost_map[y, x] + best_cost
+                parent[y, x] = y_lo + best_idx
+
+    # Backward pass: reconstruieste calea optima
+    path = np.zeros(W, dtype=np.int32)
+
+    # Ultima coloana: aleg y cu cost minim
+    last_col_costs = dp[:, W - 1]
+    if np.all(np.isinf(last_col_costs)):
+        return None, None
+    path[W - 1] = int(np.argmin(last_col_costs))
+
+    # Urmareste parent pointers inapoi
+    for x in range(W - 1, 0, -1):
+        path[x - 1] = parent[path[x], x]
+        if path[x - 1] < 0:
+            break
+
+    dp_cost = np.array([dp[path[x], x] for x in range(W)])
+
+    return path, dp_cost
+
+
+def _validate_dp_path(path, score_map, min_score_thresh):
+    """
+    Marcheaza ca "valide" doar coloanele unde scorul de umbra acustica
+    la pozitia aleasa de DP e peste un prag. Restul devin NaN.
+
+    Returneaza:
+      pleura_y_dp  : np.array(W,) float (NaN unde invalid)
+      valid_mask   : np.array(W,) bool
+      scores_along_path : np.array(W,) scorul la fiecare pozitie
+    """
+    W = len(path)
+    scores_along_path = np.array([score_map[path[x], x] for x in range(W)], dtype=np.float32)
+
+    valid_mask = scores_along_path >= min_score_thresh
+    pleura_y_dp = np.where(valid_mask, path.astype(np.float64), np.nan)
+
+    return pleura_y_dp, valid_mask, scores_along_path
+
+
 # ═════════════════════════════════════════════════════════════
 #  4. EXTRACT PLEURAL LINE — functia principala
 # ═════════════════════════════════════════════════════════════
 
-def ExtractPleuralLine(crop_image, one_pixel_mm, debug=False, debug_columns=None):
+def ExtractPleuralLine(crop_image, one_pixel_mm, debug=False, debug_columns=None,
+                        method='dp'):
     """
-    Detecteaza linia pleurala prin scanline A-mode + criteriu de umbra acustica.
+    Detecteaza linia pleurala.
+
+    Metode disponibile:
+      - 'dp'     : Dynamic Programming (RECOMANDAT) — gaseste calea optima globala
+      - 'legacy' : scanline + RANSAC (metoda veche, pastrata ca fallback)
 
     Returneaza dict cu:
         pleura_y, pleura_y_smooth, contour, scores, inlier_mask,
-        confidence, enhanced
+        confidence, enhanced, method (ce metoda s-a folosit)
     """
-    # ─ 1. Preprocessing
+    # ─ 1. Preprocessing (la fel ca inainte)
     gray = _to_gray_float(crop_image)
     enhanced = _apply_clahe(gray)
     H, W = enhanced.shape
 
-    # Safety: one_pixel_mm invalid (0 sau negativ)
     if one_pixel_mm <= 0:
         raise ValueError(
             f"one_pixel_mm invalid: {one_pixel_mm}. "
-            f"PixelConverter a esuat — verifica OCR-ul si detectia tick-urilor, "
-            f"sau hardcodeaza o valoare (tipic 0.05-0.10 mm/px pt ecografie)."
+            f"PixelConverter a esuat — hardcodeaza o valoare (tipic 0.05-0.10 mm/px)."
         )
 
     y_min = max(0, _mm_to_px(DEPTH_MIN_MM, one_pixel_mm))
     y_max = min(H - 1, _mm_to_px(DEPTH_MAX_MM, one_pixel_mm))
     if y_max <= y_min + 10:
-        raise ValueError(
-            f"Zona cautare prea mica: y_min={y_min}, y_max={y_max}, H={H}. "
-            f"Verifica one_pixel_mm={one_pixel_mm}."
-        )
+        raise ValueError(f"Zona cautare prea mica: [{y_min}, {y_max}]")
 
     shadow_offset_px = max(2, _mm_to_px(SHADOW_OFFSET_MM, one_pixel_mm))
     shadow_window_px = max(5, _mm_to_px(SHADOW_WINDOW_MM, one_pixel_mm))
 
-    # ─ 2. Scoreaza fiecare coloana
-    pleura_y = np.full(W, np.nan, dtype=np.float64)
-    scores = np.full(W, -np.inf, dtype=np.float64)
+    method_used = method
 
-    for x in range(W):
-        y_best, score_best = _score_column(
-            enhanced[:, x], y_min, y_max, shadow_offset_px, shadow_window_px
+    if method == 'dp':
+        # ─ 2a. Metoda DP
+        print("[ExtractPleuralLine] Rulez Dynamic Programming...")
+        cost_map, score_map = _compute_cost_map(
+            enhanced, y_min, y_max, shadow_offset_px, shadow_window_px
         )
-        if y_best is not None:
-            pleura_y[x] = y_best
-            scores[x] = score_best
 
-    # ─ 3. RANSAC
-    valid_mask = ~np.isnan(pleura_y)
-    xs_valid = np.where(valid_mask)[0]
-    ys_valid = pleura_y[valid_mask]
+        path, dp_cost = _dp_optimal_path(
+            cost_map, lambda_penalty=DP_LAMBDA, max_jump=DP_MAX_JUMP_PX
+        )
 
-    if len(xs_valid) < W * RANSAC_MIN_INLIERS_FRAC:
-        print(f"[ExtractPleuralLine] Putine detectii: {len(xs_valid)}/{W}")
+        if path is None:
+            print("[ExtractPleuralLine] DP a esuat, folosesc metoda legacy.")
+            method_used = 'legacy'
+        else:
+            pleura_y, valid_mask, scores_path = _validate_dp_path(
+                path, score_map, DP_MIN_SCORE_THRESH
+            )
 
-    _, inliers_of_valid = _ransac_poly(
-        xs_valid, ys_valid,
-        degree=RANSAC_POLY_DEGREE,
-        thresh=RANSAC_THRESH_PX,
-        iterations=RANSAC_ITERATIONS,
-    )
+            frac_valid = valid_mask.sum() / W
+            print(f"[ExtractPleuralLine] DP: {valid_mask.sum()}/{W} coloane valide ({100*frac_valid:.1f}%)")
 
-    inlier_mask = np.zeros(W, dtype=bool)
-    if inliers_of_valid is not None:
-        inlier_mask[xs_valid[inliers_of_valid]] = True
-    else:
-        print("[ExtractPleuralLine] RANSAC esuat, folosesc toate detectiile.")
-        inlier_mask = valid_mask.copy()
+            if frac_valid < DP_MIN_VALID_FRAC:
+                print(f"[ExtractPleuralLine] Prea putine coloane valide (<{100*DP_MIN_VALID_FRAC:.0f}%), incerc legacy.")
+                method_used = 'legacy'
+            else:
+                # DP a mers bine. Nu mai avem nevoie de RANSAC — linia e deja continua.
+                scores = scores_path.astype(np.float64)
+                scores[~valid_mask] = -np.inf
+                inlier_mask = valid_mask.copy()
 
-    # ─ 4. Smoothing + interpolare
+    if method_used == 'legacy':
+        # ─ 2b. Metoda veche (scanline + RANSAC)
+        print("[ExtractPleuralLine] Rulez scanline + RANSAC (legacy)...")
+        pleura_y = np.full(W, np.nan, dtype=np.float64)
+        scores = np.full(W, -np.inf, dtype=np.float64)
+
+        for x in range(W):
+            y_best, score_best = _score_column(
+                enhanced[:, x], y_min, y_max, shadow_offset_px, shadow_window_px
+            )
+            if y_best is not None:
+                pleura_y[x] = y_best
+                scores[x] = score_best
+
+        valid_mask = ~np.isnan(pleura_y)
+        xs_valid = np.where(valid_mask)[0]
+        ys_valid = pleura_y[valid_mask]
+
+        _, inliers_of_valid = _ransac_poly(
+            xs_valid, ys_valid,
+            degree=RANSAC_POLY_DEGREE,
+            thresh=RANSAC_THRESH_PX,
+            iterations=RANSAC_ITERATIONS,
+        )
+
+        inlier_mask = np.zeros(W, dtype=bool)
+        if inliers_of_valid is not None:
+            inlier_mask[xs_valid[inliers_of_valid]] = True
+        else:
+            inlier_mask = valid_mask.copy()
+
+    # ─ 3. Smoothing + interpolare (la fel pt ambele metode)
     xs_inlier = np.where(inlier_mask)[0]
     ys_inlier = pleura_y[inlier_mask]
     pleura_y_smooth = np.full(W, np.nan)
@@ -457,13 +633,10 @@ def ExtractPleuralLine(crop_image, one_pixel_mm, debug=False, debug_columns=None
         ys_med = medfilt(ys_inlier, kernel_size=5) if len(ys_inlier) >= 5 else ys_inlier
         try:
             spline = UnivariateSpline(xs_inlier, ys_med, k=3, s=len(xs_inlier))
-            # Acopera DOAR coloanele cu inlieri reali in apropiere (max 30 px gap)
-            # Evita extrapolarea in zonele fara suport (ex: capetele imaginii)
-            x_min, x_max = xs_inlier.min(), xs_inlier.max()
-            x_full = np.arange(x_min, x_max + 1)
+            x_min_i, x_max_i = xs_inlier.min(), xs_inlier.max()
+            x_full = np.arange(x_min_i, x_max_i + 1)
             y_full = spline(x_full)
 
-            # Constrange y_full sa nu iasa din range-ul inlierilor (+-10 px toleranta)
             y_lo = ys_inlier.min() - 10
             y_hi = ys_inlier.max() + 10
             mask_reasonable = (y_full >= y_lo) & (y_full <= y_hi)
@@ -471,31 +644,29 @@ def ExtractPleuralLine(crop_image, one_pixel_mm, debug=False, debug_columns=None
             valid_x = x_full[mask_reasonable]
             valid_y = y_full[mask_reasonable]
             pleura_y_smooth[valid_x] = valid_y
-
-            n_rejected = (~mask_reasonable).sum()
-            if n_rejected > 0:
-                print(f"[ExtractPleuralLine] Spline respins pt {n_rejected} coloane (extrapolare prea mare)")
         except Exception as e:
-            print(f"[ExtractPleuralLine] Spline esuat ({e}), folosesc interpolare liniara.")
-            x_full = np.arange(W)
-            pleura_y_smooth = np.interp(x_full, xs_inlier, ys_inlier,
+            print(f"[ExtractPleuralLine] Spline esuat ({e}), interpolare liniara.")
+            pleura_y_smooth = np.interp(np.arange(W), xs_inlier, ys_inlier,
                                          left=np.nan, right=np.nan)
-    else:
-        print(f"[ExtractPleuralLine] Prea putini inlieri ({len(xs_inlier)}).")
 
-    # ─ 5. Contur format OpenCV (pt Width_and_Irreg)
+    # ─ 4. Contur format OpenCV
     valid_smooth = ~np.isnan(pleura_y_smooth)
     xs_c = np.where(valid_smooth)[0]
     ys_c = pleura_y_smooth[valid_smooth].astype(np.int32)
     contour = np.stack([xs_c, ys_c], axis=-1).reshape(-1, 1, 2)
 
-    # ─ 6. Confidence
+    # ─ 5. Confidence
     if inlier_mask.sum() > 0:
-        confidence = float(np.clip(scores[inlier_mask].mean() / 0.3, 0.0, 1.0))
+        valid_scores_for_conf = scores[inlier_mask]
+        valid_scores_for_conf = valid_scores_for_conf[valid_scores_for_conf > -np.inf]
+        if len(valid_scores_for_conf) > 0:
+            confidence = float(np.clip(valid_scores_for_conf.mean() / 0.3, 0.0, 1.0))
+        else:
+            confidence = 0.0
     else:
         confidence = 0.0
 
-    # ─ 7. Debug plot
+    # ─ 6. Debug plot (ca inainte)
     if debug:
         _debug_plot(
             crop_image, enhanced, pleura_y, pleura_y_smooth,
@@ -512,6 +683,202 @@ def ExtractPleuralLine(crop_image, one_pixel_mm, debug=False, debug_columns=None
         'inlier_mask': inlier_mask,
         'confidence': confidence,
         'enhanced': enhanced,
+        'method': method_used,
+    }
+
+
+# ═════════════════════════════════════════════════════════════
+#  5. EXTRACT PLEURAL CONTOUR (margini sus/jos + intreruperi)
+# ═════════════════════════════════════════════════════════════
+
+def _find_band_edges(column, y_center, intensity_frac, max_half_width_px):
+    """
+    Pornind de la y_center pe coloana data, extinde sus si jos cat timp
+    intensitatea ramane peste intensity_frac * I(y_center).
+
+    Returneaza (y_top, y_bottom).
+    """
+    H = len(column)
+    y_center = int(y_center)
+    if y_center < 0 or y_center >= H:
+        return y_center, y_center
+
+    i_peak = column[y_center]
+    threshold = intensity_frac * i_peak
+
+    # Extinde in sus
+    y_top = y_center
+    for dy in range(1, max_half_width_px + 1):
+        y = y_center - dy
+        if y < 0 or column[y] < threshold:
+            break
+        y_top = y
+
+    # Extinde in jos
+    y_bot = y_center
+    for dy in range(1, max_half_width_px + 1):
+        y = y_center + dy
+        if y >= H or column[y] < threshold:
+            break
+        y_bot = y
+
+    return y_top, y_bot
+
+
+def _find_continuous_segments(pleura_smooth, min_gap_px):
+    """
+    Identifica segmente continue de pleura in pleura_smooth (array cu NaN-uri).
+    Un "gap" (secventa de NaN) ≥ min_gap_px separa doua segmente.
+
+    Returneaza lista de tupluri (x_start, x_end) inclusive.
+    """
+    W = len(pleura_smooth)
+    valid = ~np.isnan(pleura_smooth)
+
+    if valid.sum() == 0:
+        return []
+
+    # Detecteaza tranzitii valid↔invalid
+    # Prefix -1 si sufix -1 ca sa captam inceput/sfarsit
+    padded = np.concatenate(([False], valid, [False]))
+    diff = np.diff(padded.astype(int))
+    starts = np.where(diff == 1)[0]   # unde incepe un segment valid
+    ends = np.where(diff == -1)[0] - 1  # unde se termina (inclusive)
+
+    segments_raw = list(zip(starts, ends))
+
+    # Fuzionam segmente cu gap mai mic decat min_gap_px
+    if not segments_raw:
+        return []
+
+    merged = [segments_raw[0]]
+    for s, e in segments_raw[1:]:
+        prev_s, prev_e = merged[-1]
+        gap = s - prev_e - 1
+        if gap < min_gap_px:
+            merged[-1] = (prev_s, e)  # extinde segmentul anterior
+        else:
+            merged.append((s, e))
+
+    return merged
+
+
+def ExtractPleuralContour(result, img_denoised, one_pixel_mm):
+    """
+    Construieste contur(uri) complete pentru pleura detectata de ExtractPleuralLine.
+
+    Pentru fiecare segment continuu de pleura (intre intreruperi):
+      - Extinde banda sus/jos pe fiecare coloana (margine hiperecogena)
+      - Construieste contur inchis: margine_sus stanga→dreapta, margine_jos dreapta→stanga
+
+    Parametri:
+      result          : dict returnat de ExtractPleuralLine
+      img_denoised    : imaginea uint8 (dupa remove_noise) — necesara pt intensitati
+      one_pixel_mm    : rezolutia in mm/px
+
+    Returneaza dict:
+      {
+        'segments'      : lista de tupluri (x_start, x_end) — segmente continue,
+        'interruptions' : lista de tupluri (x_start, x_end, width_mm) — gap-urile,
+        'top_edges'     : lista np.array(shape=(n,2)) cu puncte (x,y) margine sus per segment,
+        'bottom_edges'  : lista np.array(shape=(n,2)) cu puncte (x,y) margine jos per segment,
+        'contours_cv'   : lista de contururi format OpenCV (N,1,2) — cate unul per segment,
+        'thickness_mm'  : np.array(W,) grosimea pleurei per coloana (NaN unde nu exista)
+      }
+    """
+    pleura_smooth = result['pleura_y_smooth']
+    enhanced = result['enhanced']  # float [0,1] — avem intensitati corecte
+    H, W = enhanced.shape
+
+    min_gap_px = max(1, _mm_to_px(INTERRUPT_MIN_GAP_MM, one_pixel_mm))
+    max_half_width_px = max(2, _mm_to_px(BAND_MAX_HALF_WIDTH_MM, one_pixel_mm))
+
+    # ─ 1. Identifica segmente continue si intreruperi
+    segments = _find_continuous_segments(pleura_smooth, min_gap_px)
+
+    # Intreruperile = gap-urile intre segmente + capetele imaginii
+    interruptions = []
+    if segments:
+        # Gap initial (daca primul segment nu incepe la x=0)
+        if segments[0][0] > 0:
+            w_mm = segments[0][0] * one_pixel_mm
+            if w_mm >= INTERRUPT_MIN_GAP_MM:
+                interruptions.append((0, segments[0][0] - 1, w_mm))
+
+        # Gap-uri intre segmente
+        for i in range(len(segments) - 1):
+            x_end_prev = segments[i][1]
+            x_start_next = segments[i + 1][0]
+            gap_start = x_end_prev + 1
+            gap_end = x_start_next - 1
+            w_mm = (gap_end - gap_start + 1) * one_pixel_mm
+            interruptions.append((gap_start, gap_end, w_mm))
+
+        # Gap final
+        if segments[-1][1] < W - 1:
+            gap_start = segments[-1][1] + 1
+            gap_end = W - 1
+            w_mm = (gap_end - gap_start + 1) * one_pixel_mm
+            if w_mm >= INTERRUPT_MIN_GAP_MM:
+                interruptions.append((gap_start, gap_end, w_mm))
+
+    # ─ 2. Pentru fiecare segment, construieste margini sus/jos
+    top_edges = []
+    bottom_edges = []
+    contours_cv = []
+    thickness_mm = np.full(W, np.nan)
+
+    for x_start, x_end in segments:
+        top_pts = []
+        bot_pts = []
+
+        for x in range(x_start, x_end + 1):
+            y_c = pleura_smooth[x]
+            if np.isnan(y_c):
+                continue
+
+            column = enhanced[:, x]
+            y_top, y_bot = _find_band_edges(
+                column, y_c, BAND_INTENSITY_FRAC, max_half_width_px
+            )
+
+            top_pts.append([x, y_top])
+            bot_pts.append([x, y_bot])
+            thickness_mm[x] = (y_bot - y_top) * one_pixel_mm
+
+        if len(top_pts) < 2:
+            continue  # segment prea scurt
+
+        top_arr = np.array(top_pts, dtype=np.int32)
+        bot_arr = np.array(bot_pts, dtype=np.int32)
+
+        top_edges.append(top_arr)
+        bottom_edges.append(bot_arr)
+
+        # Contur inchis OpenCV: sus stanga→dreapta + jos dreapta→stanga
+        cnt = np.concatenate([top_arr, bot_arr[::-1]], axis=0)
+        cnt_cv = cnt.reshape(-1, 1, 2)
+        contours_cv.append(cnt_cv)
+
+    # ─ 3. Statistici (pentru logging)
+    valid_th = ~np.isnan(thickness_mm)
+    print(f"\n[ExtractPleuralContour]")
+    print(f"  Segmente continue: {len(segments)}")
+    print(f"  Intreruperi: {len(interruptions)}")
+    for i, (xs, xe, wmm) in enumerate(interruptions):
+        print(f"    #{i+1}: x={xs}-{xe} ({wmm:.1f} mm)")
+    if valid_th.sum() > 0:
+        print(f"  Grosime pleura — mean: {thickness_mm[valid_th].mean():.2f} mm, "
+              f"max: {thickness_mm[valid_th].max():.2f} mm, "
+              f"min: {thickness_mm[valid_th].min():.2f} mm")
+
+    return {
+        'segments': segments,
+        'interruptions': interruptions,
+        'top_edges': top_edges,
+        'bottom_edges': bottom_edges,
+        'contours_cv': contours_cv,
+        'thickness_mm': thickness_mm,
     }
 
 
@@ -614,12 +981,13 @@ def _debug_plot(crop_image, enhanced, pleura_y, pleura_y_smooth,
 #  MAIN
 # ═════════════════════════════════════════════════════════════
 
-def plot_on_image(result, img_denoised, one_pixel, save_path=None):
+def plot_on_image(result, img_denoised, one_pixel, contour_result=None, save_path=None):
     """
-    Afiseaza imaginea CU linia pleurala suprapusa pentru verificare vizuala LOCALA.
+    Afiseaza imaginea CU linia pleurala si conturul suprapuse pentru verificare LOCALA.
 
-    ATENTIE: afiseaza imaginea originala — foloseste doar pentru debug local,
-    nu trimite screenshot-urile nimanui daca sunt sub NDA.
+    Daca contour_result e dat (de la ExtractPleuralContour), afiseaza si:
+      - margini sus/jos
+      - intreruperile evidentiate in rosu
 
     Daca save_path e dat, salveaza figura pe disc in loc sa o afiseze.
     """
@@ -629,36 +997,30 @@ def plot_on_image(result, img_denoised, one_pixel, save_path=None):
     enhanced = result['enhanced']
     H, W = img_denoised.shape
 
-    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    n_rows = 3 if contour_result is not None else 2
+    fig, axes = plt.subplots(n_rows, 1, figsize=(14, 5 * n_rows))
+    if n_rows == 2:
+        axes = list(axes)
+
+    xs = np.arange(W)
+    y_min_px = _mm_to_px(DEPTH_MIN_MM, one_pixel)
+    y_max_px = _mm_to_px(DEPTH_MAX_MM, one_pixel)
 
     # Rand 1: imaginea denoised + linia finala
     ax = axes[0]
     ax.imshow(img_denoised, cmap='gray')
-
-    xs = np.arange(W)
-
-    # Detectii brute (rosu, mic)
     valid_raw = ~np.isnan(pleura_y)
     ax.scatter(xs[valid_raw], pleura_y[valid_raw], s=2, c='red', alpha=0.4,
                label=f'Detectii brute ({valid_raw.sum()})')
-
-    # Inlieri RANSAC (portocaliu)
     ax.scatter(xs[inlier_mask], pleura_y[inlier_mask], s=4, c='orange', alpha=0.7,
                label=f'Inlieri RANSAC ({inlier_mask.sum()})')
-
-    # Linia finala (verde)
     valid_smooth = ~np.isnan(pleura_smooth)
     ax.plot(xs[valid_smooth], pleura_smooth[valid_smooth], 'lime', linewidth=2,
             label=f'Pleura (smooth, {valid_smooth.sum()} col)')
-
-    # Zona de cautare
-    y_min_px = _mm_to_px(DEPTH_MIN_MM, one_pixel)
-    y_max_px = _mm_to_px(DEPTH_MAX_MM, one_pixel)
     ax.axhline(y=y_min_px, color='cyan', linestyle='--', alpha=0.5,
                label=f'Zona cautare [{y_min_px}-{y_max_px} px]')
     ax.axhline(y=y_max_px, color='cyan', linestyle='--', alpha=0.5)
-
-    ax.set_title(f'Pleura detectata peste imaginea denoised — '
+    ax.set_title(f'Pleura detectata (linie mediana) — '
                  f'confidence={result["confidence"]:.2f}')
     ax.legend(loc='upper right', fontsize=9)
     ax.set_xlabel('x (px)')
@@ -671,9 +1033,34 @@ def plot_on_image(result, img_denoised, one_pixel, save_path=None):
     ax.scatter(xs[inlier_mask], pleura_y[inlier_mask], s=4, c='orange', alpha=0.6)
     ax.axhline(y=y_min_px, color='cyan', linestyle='--', alpha=0.4)
     ax.axhline(y=y_max_px, color='cyan', linestyle='--', alpha=0.4)
-    ax.set_title('Imagine dupa CLAHE (aceeasi linie)')
+    ax.set_title('Imagine dupa CLAHE')
     ax.set_xlabel('x (px)')
     ax.set_ylabel('y (px)')
+
+    # Rand 3: CONTURUL pleurei (daca e dat)
+    if contour_result is not None:
+        ax = axes[2]
+        ax.imshow(img_denoised, cmap='gray')
+
+        # Contururile per segment, fiecare cu culoare diferita (doar linii, FARA umplere)
+        colors_seg = plt.cm.spring(np.linspace(0, 1, max(1, len(contour_result['contours_cv']))))
+        for i, cnt in enumerate(contour_result['contours_cv']):
+            pts = cnt.reshape(-1, 2)
+            # Doar linia conturului — fara fill
+            ax.plot(pts[:, 0], pts[:, 1], color=colors_seg[i], linewidth=1.5,
+                    label=f'Segment {i+1} ({len(pts)//2} col)')
+
+        # Evidentiaza intreruperile in rosu (doar linii verticale pe margini, nu fill)
+        for i, (xs_i, xe_i, wmm) in enumerate(contour_result['interruptions']):
+            ax.axvline(x=xs_i, color='red', linestyle='--', linewidth=1, alpha=0.7,
+                       label=f'Intrerupere {i+1} ({wmm:.1f} mm)' if i < 3 else None)
+            ax.axvline(x=xe_i, color='red', linestyle='--', linewidth=1, alpha=0.7)
+
+        ax.set_title(f'Contur pleura — {len(contour_result["segments"])} segmente, '
+                     f'{len(contour_result["interruptions"])} intreruperi')
+        ax.legend(loc='upper right', fontsize=8)
+        ax.set_xlabel('x (px)')
+        ax.set_ylabel('y (px)')
 
     plt.tight_layout()
 
@@ -682,19 +1069,115 @@ def plot_on_image(result, img_denoised, one_pixel, save_path=None):
         print(f"[plot_on_image] Salvat in: {save_path}")
         plt.close()
     else:
-        # block=True (default) — programul asteapta aici pana inchizi
-        # ambele ferestre. Prima fereastra e deja deschisa (block=False).
         print("\n[plot_on_image] Inchide AMBELE ferestre ca sa termine programul.")
         plt.show()
 
 
+def plot_contour_zoom(contour_result, img_denoised, one_pixel, pad_mm=5.0, save_path=None):
+    """
+    Afiseaza conturul pleurei intr-o fereastra separata, zoom-at pe zona de interes.
+
+    Zoom-ul e automat: include tot conturul + un buffer de pad_mm deasupra/dedesubt.
+    Conturul apare ingrosat si clar, fara sa fie strivit de restul imaginii.
+
+    Afiseaza 2 subplot-uri:
+      - sus: imaginea denoised cu conturul supraimpus (zoom)
+      - jos: imaginea CLAHE cu conturul supraimpus (zoom)
+    """
+    if not contour_result['contours_cv']:
+        print("[plot_contour_zoom] Niciun contur de afisat.")
+        return
+
+    H, W = img_denoised.shape
+    enhanced = (img_denoised.astype(np.float32) / 255.0) if img_denoised.dtype == np.uint8 else img_denoised
+
+    # Calculeaza bounding box al tuturor contururilor
+    all_pts = np.concatenate([c.reshape(-1, 2) for c in contour_result['contours_cv']])
+    y_min = int(all_pts[:, 1].min())
+    y_max = int(all_pts[:, 1].max())
+    x_min = int(all_pts[:, 0].min())
+    x_max = int(all_pts[:, 0].max())
+
+    # Buffer vertical pentru context (in pixeli)
+    pad_px = _mm_to_px(pad_mm, one_pixel)
+    y_min = max(0, y_min - pad_px)
+    y_max = min(H - 1, y_max + pad_px)
+
+    # Buffer orizontal minim (30 px)
+    x_min = max(0, x_min - 30)
+    x_max = min(W - 1, x_max + 30)
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 8))
+
+    colors_seg = plt.cm.spring(np.linspace(0, 1, max(1, len(contour_result['contours_cv']))))
+
+    for ax, img, title in [
+        (axes[0], img_denoised, 'Imagine denoised — zoom pe pleura'),
+        (axes[1], enhanced, 'Imagine CLAHE — zoom pe pleura'),
+    ]:
+        ax.imshow(img, cmap='gray', aspect='auto')
+
+        # Contururile per segment
+        for i, cnt in enumerate(contour_result['contours_cv']):
+            pts = cnt.reshape(-1, 2)
+            n = len(pts) // 2
+            top_pts = pts[:n]
+            bot_pts = pts[n:][::-1]  # reverseaza ca sa fie stanga→dreapta
+
+            ax.plot(top_pts[:, 0], top_pts[:, 1], color=colors_seg[i],
+                    linewidth=2, label=f'Segment {i+1} (sus)')
+            ax.plot(bot_pts[:, 0], bot_pts[:, 1], color=colors_seg[i],
+                    linewidth=2, linestyle='--', label=f'Segment {i+1} (jos)')
+
+        # Linii verticale pentru intreruperi
+        for i, (xs_i, xe_i, wmm) in enumerate(contour_result['interruptions']):
+            if xs_i < x_max and xe_i > x_min:  # doar daca e in zoom
+                ax.axvline(x=xs_i, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                ax.axvline(x=xe_i, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+                # Eticheta cu latimea intreruperii
+                x_mid = (xs_i + xe_i) / 2
+                if x_min < x_mid < x_max:
+                    ax.text(x_mid, y_min + 3, f'{wmm:.1f}mm',
+                            color='red', fontsize=9, ha='center',
+                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_max, y_min)  # inversat (y creste in jos)
+        ax.set_title(title)
+        ax.set_xlabel('x (px)')
+        ax.set_ylabel('y (px)')
+        if ax is axes[0]:
+            ax.legend(loc='upper right', fontsize=8, ncol=2)
+
+    # Titlu general cu statistici
+    thickness = contour_result['thickness_mm']
+    valid_th = ~np.isnan(thickness)
+    if valid_th.sum() > 0:
+        stat_str = (f'Grosime: mean={thickness[valid_th].mean():.2f}mm, '
+                    f'min={thickness[valid_th].min():.2f}mm, '
+                    f'max={thickness[valid_th].max():.2f}mm  |  '
+                    f'{len(contour_result["segments"])} segmente, '
+                    f'{len(contour_result["interruptions"])} intreruperi')
+    else:
+        stat_str = 'Nicio grosime valida'
+
+    plt.suptitle(f'Contur pleura (zoom)  —  {stat_str}', fontsize=11, y=0.995)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=100, bbox_inches='tight')
+        print(f"[plot_contour_zoom] Salvat in: {save_path}")
+        plt.close()
+    else:
+        plt.show(block=False)
+
+
 def main():
-    orig_Image = io.imread('./ORIGINAL_IMAGES/1.jpg')
+    orig_Image = io.imread('./ORIGINAL_IMAGES/56.jpg')
 
     one_pixel = PixelConverter(orig_Image)
     print(f"Un pixel = {one_pixel:.4f} mm")
 
-    # Safety: daca OCR-ul a esuat, foloseste o valoare hardcodata
     if one_pixel <= 0 or one_pixel > 0.5:
         print("\n[main] PixelConverter a dat o valoare suspecta. Folosesc fallback.")
         one_pixel = 0.07
@@ -703,13 +1186,20 @@ def main():
     crop_image = CropBorder(orig_Image)
     img_denoised = remove_noise(crop_image)
 
+    # Pasul 1: detecteaza linia mediana a pleurei
     result = ExtractPleuralLine(img_denoised, one_pixel, debug=False)
+
+    # Pasul 2: construieste conturul (margini sus/jos + intreruperi)
+    contour_result = ExtractPleuralContour(result, img_denoised, one_pixel)
 
     # Raport numeric + grafice abstracte (fara imagine) — pt partajat
     print_debug_report(result, img_denoised, one_pixel)
 
-    # Plot pe imagine — DOAR pentru verificare locala (NDA-safe)
-    plot_on_image(result, img_denoised, one_pixel)
+    # FEREASTRA A: plot zoom pe contur (pentru vizualizare detaliata — NDA local)
+    plot_contour_zoom(contour_result, img_denoised, one_pixel)
+
+    # FEREASTRA B: plot full cu linia + contur (NDA local)
+    plot_on_image(result, img_denoised, one_pixel, contour_result=contour_result)
 
 
 def print_debug_report(result, img_denoised, one_pixel):
@@ -731,6 +1221,9 @@ def print_debug_report(result, img_denoised, one_pixel):
     print("\n" + "═" * 60)
     print("  RAPORT DEBUG — ExtractPleuralLine (date anonime)")
     print("═" * 60)
+
+    print(f"\n[Metoda]")
+    print(f"  {result.get('method', 'unknown').upper()}")
 
     print(f"\n[Dimensiuni]")
     print(f"  Imagine: {W} x {H} px")
