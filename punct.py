@@ -54,16 +54,8 @@ DP_MAX_JUMP_PX = 25      # saltul maxim permis intre coloane vecine (px)
 DP_MIN_SCORE_THRESH = 0.05  # scor minim pt o coloana sa fie "valida" dupa DP
 DP_MIN_VALID_FRAC = 0.4  # % minim coloane valide pt acceptarea caii DP
 
-# ANTI-FASCIE — A-lines detection (artefacte de reverberatie sub pleura)
-# A-lines sunt patognomonice pentru pleura: linii orizontale paralele sub pleura,
-# distantate egal (la multipli ai distantei piele-pleura). Fascia NU produce A-lines.
-ALINE_SEARCH_DEPTH_MM = 30.0  # cat de adanc cautam A-lines sub un candidat
-ALINE_BAND_HEIGHT_PX = 3      # latime pt detectia unei "linii" hiperecogene
-ALINE_MIN_PERIODICITY = 0.35  # scor minim de periodicitate (0=zgomot, 1=perfect periodic)
-ALINE_BONUS_WEIGHT = 0.8      # cat de mult contribuie scorul A-line la cost (mare = dominant)
-
-# BIAS ADANCIME — la egalitate, prefera pic mai adanc (pleura e sub fascie)
-DEPTH_BIAS_WEIGHT = 0.25      # 0 = fara bias, 0.3 = bias agresiv spre y mare
+# Sistem semi-automat (click-uri pentru anchor points)
+ANCHOR_TOLERANCE_PX = 5  # cat de departe poate devia DP de la click-ul utilizatorului
 
 # Contur pleura — detectie bazata pe gradient (margini fizice reale)
 INTERRUPT_MIN_GAP_MM = 3.0       # gap ≥ 3mm = intrerupere reala
@@ -420,145 +412,40 @@ def _ransac_poly(xs, ys, degree=2, thresh=15, iterations=200):
 #  DYNAMIC PROGRAMMING — cale optima prin imagine
 # ─────────────────────────────────────────────────────────────
 
-def _compute_aline_score_map(enhanced, y_min, y_max, aline_depth_px,
-                                band_height_px, min_periodicity):
-    """
-    Pentru fiecare (x, y) candidat ca pleura, calculeaza un scor de A-lines:
-    cat de "periodic-orizontale" sunt structurile sub acel y.
-
-    A-lines sunt artefacte de reverberatie:
-      - Linii orizontale luminoase paralele
-      - Distantate la multipli ai distantei piele-pleura
-      - APAR DOAR sub pleura (plamanul aerat reflecta complet)
-      - NU APAR sub fascie (acolo e tesut, nu aer)
-
-    Algoritm:
-      Pentru fiecare (x, y):
-        1. Extrage profilul vertical sub y (de la y+offset la y+aline_depth)
-        2. Calculeaza autocorelatia 1D
-        3. Cauta varfuri secundare (peak-uri la distanta > 0)
-        4. Scor = puterea varfului dominant / energia totala (in [0, 1])
-
-    Args:
-      enhanced            : imaginea CLAHE in [0, 1]
-      y_min, y_max        : zona de cautare
-      aline_depth_px      : adancime de analiza sub y
-      band_height_px      : latime banda pt o "linie" hiperecogena
-      min_periodicity     : prag minim — sub asta scorul = 0
-
-    Returneaza:
-      aline_map : np.array(H, W) — scoruri A-line in [0, 1]
-    """
-    H, W = enhanced.shape
-    aline_map = np.zeros((H, W), dtype=np.float32)
-
-    # Pre-calcul: profil orizontal mediu pe ferestre verticale mici
-    # In loc sa procesam pixel cu pixel, aplicam un filtru orizontal
-    # ca sa extragem energia "linii orizontale" la fiecare y
-    # Folosim un kernel orizontal lung (15 px) ca sa capturam linii lungi
-    horiz_kernel = np.ones((1, 15), dtype=np.float32) / 15.0
-    horiz_response = cv2.filter2D(enhanced, cv2.CV_32F, horiz_kernel)
-
-    # Pentru fiecare y candidat (intre y_min si y_max), calculam autocorelatie
-    # pe profilul vertical sub y
-    for y in range(y_min, y_max + 1):
-        y_start = y + band_height_px * 2  # skip zona de reverberatie imediata
-        y_end = min(H, y + aline_depth_px)
-        if y_end - y_start < 20:
-            continue
-
-        # Extrage profilul vertical pentru fiecare coloana (sub y candidat)
-        # Shape: (depth, W)
-        profile_block = horiz_response[y_start:y_end, :]
-
-        # Pentru viteza, calculam autocorelatie pe medie pe blocuri de coloane
-        # (presupunem ca A-lines sunt similare pe coloane vecine ~50px)
-        block_size = 50
-        for x_start in range(0, W, block_size):
-            x_end = min(W, x_start + block_size)
-            avg_profile = profile_block[:, x_start:x_end].mean(axis=1)
-
-            # Normalizeaza profilul (centreaza si imparte la std)
-            avg_profile = avg_profile - avg_profile.mean()
-            std = avg_profile.std()
-            if std < 1e-6:
-                continue
-            avg_profile = avg_profile / std
-
-            # Autocorelatie (correlate cu sine)
-            n = len(avg_profile)
-            autocorr = np.correlate(avg_profile, avg_profile, mode='full')
-            autocorr = autocorr[n - 1:]  # doar partea pozitiva
-
-            # Normalizeaza astfel incat autocorr[0] = 1
-            autocorr = autocorr / max(autocorr[0], 1e-6)
-
-            # Cauta varfuri secundare (la lag > 8, ca sa evitam lag mic = same signal)
-            # A-lines reale au periodicitate ~10-30 px (10-15 mm la rezolutia tipica)
-            min_lag = 8
-            search_zone = autocorr[min_lag:min(len(autocorr), 60)]
-            if len(search_zone) > 0:
-                periodicity = float(search_zone.max())  # cel mai puternic peak secundar
-                if periodicity >= min_periodicity:
-                    # Asigneaza scorul tuturor coloanelor din bloc
-                    aline_map[y, x_start:x_end] = periodicity
-
-    return aline_map
-
-
-def _compute_cost_map(enhanced, y_min, y_max, shadow_offset_px, shadow_window_px,
-                      aline_map=None, aline_weight=0.0,
-                      depth_bias_weight=0.0):
+def _compute_cost_map(enhanced, y_min, y_max, shadow_offset_px, shadow_window_px):
     """
     Calculeaza hartea de cost pt DP. Pentru fiecare (x, y) in zona de cautare:
-      score(x, y) = (intensitate(y) - mean(zona_dedesubt))         # umbra acustica
-                  + aline_weight * aline_score(x, y)                # bonus A-lines
-                  + depth_bias * (y - y_min) / (y_max - y_min)      # prefera adancime
-      cost(x, y) = 1 - score_normalizat
-
-    Args:
-      aline_map         : scor A-lines per (x, y) [0, 1] sau None
-      aline_weight      : pondere bonus A-lines (0=ignorat, 1=dominat)
-      depth_bias_weight : pondere bias spre adancime (favorizeaza pleura sub fascie)
+      score(x, y) = I(x, y) - mean(I(x, y+offset : y+offset+window))
+      cost(x, y) = 1 - score_normalizat (cu cat e mai mare scorul, cu atat cost mai mic)
 
     Returneaza:
       cost_map  : np.array(H, W) — costuri in [0, 1], inf in zona invalida
-      score_map : np.array(H, W) — scorurile brute combinate
+      score_map : np.array(H, W) — scorurile brute (pt raportare)
     """
     H, W = enhanced.shape
     score_map = np.full((H, W), -np.inf, dtype=np.float32)
 
-    # Suma cumulativa pe coloane pt fereastra medie rapida
+    # Precalculeaza suma cumulativa pe coloane pt fereastra medie rapida
+    # csum[i, x] = suma enhanced[0:i, x]
     csum = np.concatenate([np.zeros((1, W), dtype=np.float32),
                             np.cumsum(enhanced, axis=0, dtype=np.float32)], axis=0)
 
-    depth_range = max(y_max - y_min, 1)
-
+    # Pentru fiecare y din zona valida, calculeaza scorul simultan pe toate coloanele
     for y in range(y_min, y_max + 1):
         y_start = y + shadow_offset_px
         y_end = y + shadow_offset_px + shadow_window_px
         if y_end >= H:
             continue
 
+        # Intensitatea la (y, all_x)
         i_peak = enhanced[y, :]
+        # Media ferestrei de umbra pe fiecare coloana
         window_sum = csum[y_end, :] - csum[y_start, :]
         window_mean = window_sum / shadow_window_px
 
-        # Scor de baza: umbra acustica
-        base_score = i_peak - window_mean
+        score_map[y, :] = i_peak - window_mean
 
-        # Bonus A-lines (daca avem)
-        if aline_map is not None and aline_weight > 0:
-            base_score = base_score + aline_weight * aline_map[y, :]
-
-        # Bias depth: la egalitate, prefera y mai mare (mai jos in imagine)
-        if depth_bias_weight > 0:
-            depth_factor = (y - y_min) / depth_range
-            base_score = base_score + depth_bias_weight * depth_factor
-
-        score_map[y, :] = base_score
-
-    # Transforma scor -> cost. Norm la [0, 1].
+    # Transforma scor → cost. Valori mari scor = cost mic. Norm la [0, 1].
     valid = score_map > -np.inf
     if not valid.any():
         return np.full_like(score_map, np.inf), score_map
@@ -573,12 +460,21 @@ def _compute_cost_map(enhanced, y_min, y_max, shadow_offset_px, shadow_window_px
     return cost_map, score_map
 
 
-def _dp_optimal_path(cost_map, lambda_penalty, max_jump):
+def _dp_optimal_path(cost_map, lambda_penalty, max_jump, anchors=None,
+                     anchor_tolerance=5):
     """
     Dynamic Programming: gaseste calea optima (un y per coloana) minimizand:
       sum_x [ cost(x, y_x) ] + lambda * sum_x [ |y_x - y_{x-1}| ]
 
     Saltul vertical intre coloane vecine e limitat la max_jump px.
+
+    Daca anchors e dat (lista de tupluri (x, y)), DP e fortat sa treaca prin
+    aceste puncte (cu o toleranta de ±anchor_tolerance px). Util pentru
+    sistem semi-automat unde utilizatorul indica click-uri pe pleura.
+
+    Args:
+      anchors          : lista [(x1, y1), (x2, y2), ...] sau None
+      anchor_tolerance : toleranta in px pe verticala pentru fiecare anchor
 
     Returneaza:
       path    : np.array(W,) coordonate y optime per coloana
@@ -586,15 +482,68 @@ def _dp_optimal_path(cost_map, lambda_penalty, max_jump):
     """
     H, W = cost_map.shape
 
+    # Aplicam constraint-urile de anchor: in coloanele ANCHOR si jur (+/-anchor_x_radius),
+    # doar y in [y_anchor - tol, y_anchor + tol] sunt permise (rest = inf cost)
+    cost_map_constrained = cost_map.copy()
+    anchor_x_radius = 30  # coloane de fiecare parte unde anchor-ul are influenta directa
+
+    if anchors:
+        # Sortam anchor-urile dupa x ca sa stim care e primul/ultimul
+        anchors_sorted = sorted([(int(x), int(y)) for (x, y) in anchors],
+                                 key=lambda a: a[0])
+
+        # Extindem si la stanga primului anchor + dreapta ultimului anchor
+        # (ca toata latimea sa fie "tinuta" de pleura, nu doar zona dintre clicks)
+        first_x, first_y = anchors_sorted[0]
+        last_x, last_y = anchors_sorted[-1]
+
+        # Aplicam restrictie clasica pe fiecare anchor + vecini
+        for (x_a, y_a) in anchors_sorted:
+            if 0 <= x_a < W and 0 <= y_a < H:
+                y_lo = max(0, y_a - anchor_tolerance)
+                y_hi = min(H, y_a + anchor_tolerance + 1)
+                x_start = max(0, x_a - anchor_x_radius)
+                x_end = min(W, x_a + anchor_x_radius + 1)
+                for xx in range(x_start, x_end):
+                    temp_col = np.full(H, np.inf, dtype=np.float32)
+                    temp_col[y_lo:y_hi] = cost_map[y_lo:y_hi, xx]
+                    cost_map_constrained[:, xx] = temp_col
+                print(f"[DP] Anchor: x={x_a}, y={y_a} "
+                      f"(toleranta ±{anchor_tolerance}px, latime {2*anchor_x_radius+1}px)")
+
+        # Extensie la STANGA primului anchor: aplicam constraint cu o toleranta crescuta
+        # (linia poate sa devieze putin in lateral, dar ramane in zona pleurei)
+        extended_tolerance = anchor_tolerance * 4  # toleranta mai mare la capete
+        if first_x > anchor_x_radius:
+            y_lo_ext = max(0, first_y - extended_tolerance)
+            y_hi_ext = min(H, first_y + extended_tolerance + 1)
+            for xx in range(0, max(0, first_x - anchor_x_radius)):
+                temp_col = np.full(H, np.inf, dtype=np.float32)
+                temp_col[y_lo_ext:y_hi_ext] = cost_map[y_lo_ext:y_hi_ext, xx]
+                cost_map_constrained[:, xx] = temp_col
+            print(f"[DP] Extensie stanga: x=0-{first_x - anchor_x_radius - 1}, "
+                  f"y centrat pe {first_y} (±{extended_tolerance}px)")
+
+        # Extensie la DREAPTA ultimului anchor
+        if last_x < W - anchor_x_radius - 1:
+            y_lo_ext = max(0, last_y - extended_tolerance)
+            y_hi_ext = min(H, last_y + extended_tolerance + 1)
+            for xx in range(min(W, last_x + anchor_x_radius + 1), W):
+                temp_col = np.full(H, np.inf, dtype=np.float32)
+                temp_col[y_lo_ext:y_hi_ext] = cost_map[y_lo_ext:y_hi_ext, xx]
+                cost_map_constrained[:, xx] = temp_col
+            print(f"[DP] Extensie dreapta: x={last_x + anchor_x_radius + 1}-{W-1}, "
+                  f"y centrat pe {last_y} (±{extended_tolerance}px)")
+
     # Tabela DP: dp[y, x] = cost minim al caii optime pana la (x, y)
     dp = np.full((H, W), np.inf, dtype=np.float32)
     parent = np.full((H, W), -1, dtype=np.int32)
 
-    dp[:, 0] = cost_map[:, 0]
+    dp[:, 0] = cost_map_constrained[:, 0]
 
     for x in range(1, W):
         for y in range(H):
-            if cost_map[y, x] == np.inf:
+            if cost_map_constrained[y, x] == np.inf:
                 continue
 
             y_lo = max(0, y - max_jump)
@@ -608,7 +557,7 @@ def _dp_optimal_path(cost_map, lambda_penalty, max_jump):
             best_cost = total[best_idx]
 
             if best_cost < np.inf:
-                dp[y, x] = cost_map[y, x] + best_cost
+                dp[y, x] = cost_map_constrained[y, x] + best_cost
                 parent[y, x] = y_lo + best_idx
 
     path = np.zeros(W, dtype=np.int32)
@@ -650,14 +599,17 @@ def _validate_dp_path(path, score_map, min_score_thresh):
 # ═════════════════════════════════════════════════════════════
 
 def ExtractPleuralLine(crop_image, one_pixel_mm, debug=False, debug_columns=None,
-                        method='dp'):
+                        method='dp', anchors=None):
     """
     Detecteaza linia pleurala.
 
     Metode disponibile:
       - 'dp'     : Dynamic Programming (RECOMANDAT) — gaseste calea optima globala
-                   cu anti-fascie (A-lines) + bias adancime
       - 'legacy' : scanline + RANSAC (metoda veche, pastrata ca fallback)
+
+    Args:
+      anchors  : lista [(x, y), ...] de puncte pe care DP trebuie sa le respecte
+                 (toleranta ±ANCHOR_TOLERANCE_PX px). Util pt sistem semi-automat.
 
     Returneaza dict cu:
         pleura_y, pleura_y_smooth, contour, scores, inlier_mask,
@@ -685,31 +637,19 @@ def ExtractPleuralLine(crop_image, one_pixel_mm, debug=False, debug_columns=None
     method_used = method
 
     if method == 'dp':
-        # ─ 2a. Metoda DP cu anti-fascie (A-lines) si bias adancime
-        print("[ExtractPleuralLine] Rulez Dynamic Programming...")
-
-        # A-lines: detecteaza zone unde sub candidat exista pattern periodic orizontal
-        # (artefacte de reverberatie patognomonice pentru pleura)
-        aline_depth_px = max(20, _mm_to_px(ALINE_SEARCH_DEPTH_MM, one_pixel_mm))
-        print(f"[ExtractPleuralLine] Calculez A-line scores (depth={aline_depth_px}px)...")
-        aline_map = _compute_aline_score_map(
-            enhanced, y_min, y_max,
-            aline_depth_px=aline_depth_px,
-            band_height_px=ALINE_BAND_HEIGHT_PX,
-            min_periodicity=ALINE_MIN_PERIODICITY,
-        )
-        n_aline_cols = (aline_map > 0).any(axis=0).sum()
-        print(f"[ExtractPleuralLine] A-line: {n_aline_cols}/{W} coloane cu pattern periodic")
+        # ─ 2a. Metoda DP
+        if anchors:
+            print(f"[ExtractPleuralLine] Rulez Dynamic Programming cu {len(anchors)} anchor-uri...")
+        else:
+            print("[ExtractPleuralLine] Rulez Dynamic Programming...")
 
         cost_map, score_map = _compute_cost_map(
-            enhanced, y_min, y_max, shadow_offset_px, shadow_window_px,
-            aline_map=aline_map,
-            aline_weight=ALINE_BONUS_WEIGHT,
-            depth_bias_weight=DEPTH_BIAS_WEIGHT,
+            enhanced, y_min, y_max, shadow_offset_px, shadow_window_px
         )
 
         path, dp_cost = _dp_optimal_path(
             cost_map, lambda_penalty=DP_LAMBDA, max_jump=DP_MAX_JUMP_PX,
+            anchors=anchors, anchor_tolerance=ANCHOR_TOLERANCE_PX
         )
 
         if path is None:
@@ -1577,14 +1517,19 @@ def plot_contour_zoom(contour_result, img_denoised, one_pixel, pad_mm=5.0, save_
         plt.show(block=False)
 
 
-def plot_contour_clean(contour_result, img_denoised, result=None, save_path=None):
+def plot_contour_clean(contour_result, img_denoised, save_path=None):
     """
-    Afiseaza imaginea + conturul pleurei + linia mediana (daca e data).
+    Afiseaza imaginea + conturul pleurei, FARA decoratii.
+    Fara titlu, fara legenda, fara axe vizibile, fara linii suplimentare.
 
     Doar:
-      - imaginea (grayscale) — ocupa tot spatiul, fara padding
-      - liniile conturului (sus + jos) per segment - GALBEN
-      - linia mediana DP - VERDE LIME (daca result e dat)
+      - imaginea (grayscale)
+      - liniile conturului (sus + jos) per segment, in culori distincte
+
+    Util pentru:
+      - inspectie vizuala curata
+      - includere ca figura in lucrare
+      - capturi pentru documentatie
     """
     if not contour_result['contours_cv']:
         print("[plot_contour_clean] Niciun contur de afisat.")
@@ -1592,38 +1537,26 @@ def plot_contour_clean(contour_result, img_denoised, result=None, save_path=None
 
     H, W = img_denoised.shape
 
-    # Calculez dimensiunea figurii proportionala cu imaginea (evita padding negru)
-    # Folosesc DPI=100 si pastrez raportul real al imaginii
-    fig_width = 14.0
-    fig_height = fig_width * H / W  # pastreaza raportul real
+    fig, ax = plt.subplots(1, 1, figsize=(14, 7))
+    ax.imshow(img_denoised, cmap='gray', aspect='equal')
 
-    fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
-    ax.imshow(img_denoised, cmap='gray', aspect='auto')  # 'auto' = umple toata axa
+    # Doar liniile conturului — fiecare segment cu culoare diferita
+    colors_seg = plt.cm.spring(np.linspace(0, 1, max(1, len(contour_result['contours_cv']))))
 
-    # Marginile conturului (sus + jos) — GALBEN
     for i, (top_arr, bot_arr) in enumerate(zip(contour_result['top_edges'],
                                                  contour_result['bottom_edges'])):
-        ax.plot(top_arr[:, 0], top_arr[:, 1], color='yellow', linewidth=1.0)
-        ax.plot(bot_arr[:, 0], bot_arr[:, 1], color='yellow', linewidth=1.0)
+        ax.plot(top_arr[:, 0], top_arr[:, 1], color=colors_seg[i], linewidth=1.5)
+        ax.plot(bot_arr[:, 0], bot_arr[:, 1], color=colors_seg[i], linewidth=1.5)
 
-    # Linia mediana — VERDE LIME (deasupra conturului, mai vizibil)
-    if result is not None:
-        pleura_smooth = result['pleura_y_smooth']
-        valid = ~np.isnan(pleura_smooth)
-        xs = np.where(valid)[0]
-        if len(xs) > 0:
-            ax.plot(xs, pleura_smooth[valid], color='lime', linewidth=2.0)
-
-    # Setez limitele EXACT pe dimensiunea imaginii
-    ax.set_xlim(0, W)
-    ax.set_ylim(H, 0)
+    # Curatenie totala: fara axe, fara titlu, fara grila
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_xlabel('')
     ax.set_ylabel('')
+    ax.set_xlim(0, W)
+    ax.set_ylim(H, 0)  # invertat (y creste in jos)
 
-    # Elimin marginile interne ale figurii (subplot ocupa tot spatiul)
-    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+    plt.tight_layout()
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight', pad_inches=0)
@@ -1631,8 +1564,158 @@ def plot_contour_clean(contour_result, img_denoised, result=None, save_path=None
         plt.close()
     else:
         plt.show(block=False)
-        plt.show(block=False)
 
+
+def interactive_single_image(image_path='./ORIGINAL_IMAGES/1.jpg',
+                              output_dir='./CONTUR_OUTPUT_INTERACTIVE'):
+    """
+    Sistem semi-automat pentru detectie pleura pe O SINGURA imagine.
+
+    Workflow:
+      1. Afiseaza imaginea
+      2. Utilizatorul face click pe pleura (2-3 puncte recomandate)
+      3. ENTER cand a terminat → algoritmul ruleaza
+      4. R cand vrea reset → click-uri din nou
+      5. Confirma rezultatul → salveaza ca PNG
+
+    Util pentru testarea sistemului inainte de batch processing.
+    """
+    import os
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"\n{'═'*60}")
+    print(f"  SISTEM SEMI-AUTOMAT — testare pe o imagine")
+    print(f"{'═'*60}")
+    print(f"  Imagine: {image_path}")
+    print(f"  Toleranta click: ±{ANCHOR_TOLERANCE_PX} px")
+    print(f"\n  INSTRUCTIUNI:")
+    print(f"    - Click STANGA pe pleura (recomandat 2-3 puncte: stanga, mijloc, dreapta)")
+    print(f"    - Apasa ENTER cand ai terminat")
+    print(f"    - Apasa R pentru a reseta click-urile")
+    print(f"    - Apasa ESC pentru a iesi fara salvare")
+    print(f"{'═'*60}\n")
+
+    # ─ 1. Procesare standard (pana inainte de ExtractPleuralLine)
+    orig = io.imread(image_path)
+    one_pixel = PixelConverter(orig)
+    if one_pixel <= 0 or one_pixel > 0.5:
+        print("[main] PixelConverter a esuat. Folosesc fallback 0.07 mm/px.")
+        one_pixel = 0.07
+
+    crop = CropBorder(orig)
+    img_denoised = remove_noise(crop)
+    H, W = img_denoised.shape
+
+    # ─ 2. Afisare imagine + colectare click-uri
+    fig, ax = plt.subplots(1, 1, figsize=(14, 8))
+    ax.imshow(img_denoised, cmap='gray')
+    ax.set_title(f'{os.path.basename(image_path)} — '
+                 f'CLICK pe pleura (2-3 puncte) | ENTER=run | R=reset | ESC=exit')
+
+    clicks = []  # lista de (x, y) clickuri
+    click_markers = []  # artefacte matplotlib pt afisare
+    state = {'finished': False, 'cancelled': False}
+
+    def on_click(event):
+        if event.inaxes != ax or event.button != 1:  # doar click stanga in axa
+            return
+        x, y = int(event.xdata), int(event.ydata)
+        clicks.append((x, y))
+        marker, = ax.plot(x, y, 'r+', markersize=15, markeredgewidth=2)
+        click_markers.append(marker)
+        ax.set_title(f'{os.path.basename(image_path)} — '
+                     f'{len(clicks)} click(uri) | ENTER=run | R=reset | ESC=exit')
+        fig.canvas.draw_idle()
+        print(f"  Click {len(clicks)}: x={x}, y={y}")
+
+    def on_key(event):
+        if event.key == 'enter':
+            if len(clicks) == 0:
+                print("  Nu ai dat niciun click! Da macar 1.")
+                return
+            state['finished'] = True
+            plt.close(fig)
+        elif event.key == 'r':
+            clicks.clear()
+            for m in click_markers:
+                m.remove()
+            click_markers.clear()
+            ax.set_title(f'{os.path.basename(image_path)} — '
+                         f'RESET | CLICK pe pleura | ENTER=run | R=reset | ESC=exit')
+            fig.canvas.draw_idle()
+            print("  Reset click-uri")
+        elif event.key == 'escape':
+            state['cancelled'] = True
+            plt.close(fig)
+            print("  Iesire fara salvare")
+
+    fig.canvas.mpl_connect('button_press_event', on_click)
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    plt.show()  # blocheaza pana fereastra e inchisa
+
+    if state['cancelled']:
+        return None
+    if not state['finished'] or len(clicks) == 0:
+        print("Niciun click dat. Iesire.")
+        return None
+
+    print(f"\n  Procesez cu {len(clicks)} anchor-uri: {clicks}")
+
+    # ─ 3. Ruleaza ExtractPleuralLine cu anchors
+    result = ExtractPleuralLine(img_denoised, one_pixel, debug=False,
+                                  anchors=clicks)
+    contour_result = ExtractPleuralContour(result, img_denoised, one_pixel)
+
+    # ─ 4. Afiseaza rezultat curat (cu marcaj click-urilor)
+    fig2, ax2 = plt.subplots(1, 1, figsize=(14, 8))
+    ax2.imshow(img_denoised, cmap='gray')
+
+    # Conturul
+    colors_seg = plt.cm.spring(np.linspace(0, 1, max(1, len(contour_result['contours_cv']))))
+    for i, (top_arr, bot_arr) in enumerate(zip(contour_result['top_edges'],
+                                                 contour_result['bottom_edges'])):
+        ax2.plot(top_arr[:, 0], top_arr[:, 1], color=colors_seg[i], linewidth=1.5)
+        ax2.plot(bot_arr[:, 0], bot_arr[:, 1], color=colors_seg[i], linewidth=1.5)
+
+    # Click-urile (galben)
+    for (x, y) in clicks:
+        ax2.plot(x, y, 'y+', markersize=15, markeredgewidth=2.5)
+
+    ax2.set_xticks([])
+    ax2.set_yticks([])
+    ax2.set_xlim(0, W)
+    ax2.set_ylim(H, 0)
+
+    img_name = os.path.splitext(os.path.basename(image_path))[0]
+    output_path = os.path.join(output_dir, f"{img_name}_interactive.png")
+
+    ax2.set_title(f'{img_name} — Rezultat | INCHIDE fereastra ca sa decizi salvarea')
+    plt.tight_layout()
+    plt.show()
+
+    # ─ 5. Confirmare salvare in consola
+    response = input(f"\n  Salvezi ca {output_path}? [Y/n]: ").strip().lower()
+    if response in ('', 'y', 'yes', 'da'):
+        # Re-genereaza fara titlu pentru salvare curata
+        fig3, ax3 = plt.subplots(1, 1, figsize=(14, 8))
+        ax3.imshow(img_denoised, cmap='gray')
+        for i, (top_arr, bot_arr) in enumerate(zip(contour_result['top_edges'],
+                                                     contour_result['bottom_edges'])):
+            ax3.plot(top_arr[:, 0], top_arr[:, 1], color=colors_seg[i], linewidth=1.5)
+            ax3.plot(bot_arr[:, 0], bot_arr[:, 1], color=colors_seg[i], linewidth=1.5)
+        ax3.set_xticks([])
+        ax3.set_yticks([])
+        ax3.set_xlim(0, W)
+        ax3.set_ylim(H, 0)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight', pad_inches=0)
+        plt.close(fig3)
+        print(f"  Salvat: {output_path}")
+    else:
+        print("  Nu s-a salvat.")
+
+    return contour_result
 
 
 def batch_process(input_dir='./ORIGINAL_IMAGES', output_dir='./CONTUR_OUTPUT',
@@ -1692,13 +1775,12 @@ def batch_process(input_dir='./ORIGINAL_IMAGES', output_dir='./CONTUR_OUTPUT',
             result = ExtractPleuralLine(denoised, one_pixel, debug=False)
             contour_result = ExtractPleuralContour(result, denoised, one_pixel)
 
-            # Salveaza imagine curata cu linia mediana + contur
-            plot_contour_clean(contour_result, denoised, result=result,
-                                save_path=output_path)
+            # Salveaza imagine curata
+            plot_contour_clean(contour_result, denoised, save_path=output_path)
 
             # Optional: afiseaza primele max_display
             if not save_only and i < max_display:
-                plot_contour_clean(contour_result, denoised, result=result)
+                plot_contour_clean(contour_result, denoised)
 
             success_count += 1
             print(f"OK ({one_pixel:.4f} mm/px)")
@@ -1721,7 +1803,7 @@ def batch_process(input_dir='./ORIGINAL_IMAGES', output_dir='./CONTUR_OUTPUT',
 
 
 def main():
-    orig_Image = io.imread('./ORIGINAL_IMAGES/56.jpg')
+    orig_Image = io.imread('./ORIGINAL_IMAGES/27.jpg')
 
     one_pixel = PixelConverter(orig_Image)
     print(f"Un pixel = {one_pixel:.4f} mm")
@@ -1935,12 +2017,18 @@ def print_debug_report(result, img_denoised, one_pixel):
 
 
 if __name__ == '__main__':
-    # Modul 1: o singura imagine cu plot-uri de debug (testare)
+    # Modul 1: o singura imagine cu plot-uri standard de debug
     # main()
 
-    # Modul 2 (ACTIV): batch automat pe toate imaginile din ORIGINAL_IMAGES
-    batch_process(
-        input_dir='./ORIGINAL_IMAGES',
-        output_dir='./CONTUR_OUTPUT',
-        save_only=True,
+    # Modul 2 (ACTIV): SISTEM SEMI-AUTOMAT pe O imagine (cu click-uri)
+    interactive_single_image(
+        image_path='./ORIGINAL_IMAGES/1.jpg',
+        output_dir='./CONTUR_OUTPUT_INTERACTIVE',
     )
+
+    # Modul 3: batch automat pe toate imaginile
+    # batch_process(
+    #     input_dir='./ORIGINAL_IMAGES',
+    #     output_dir='./CONTUR_OUTPUT',
+    #     save_only=True,
+    # )
