@@ -21,7 +21,7 @@ from scipy.sparse.csgraph import connected_components
 # ============================================================
 
 INPUT_DIR = r"C:\Facultate\AN4\Licenta\Licenta-Cod\ORIGINAL_IMAGES"
-OUTPUT_ROOT = r"C:\Facultate\AN4\Licenta\Licenta-Cod\DEBUG_OUT_INITIAL_BATCH"
+OUTPUT_ROOT = r"C:\Facultate\AN4\Licenta\Licenta-Cod\DEBUG_OUT_AUTO_MODE"
 TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 START_IDX = 0
@@ -31,43 +31,13 @@ ONE_PIXEL_FALLBACK = 0.07
 
 
 # ============================================================
-# CALIBRARE PE IMAGINILE VERIFICATE DE TINE
+# MODURI AUTOMATE
 # ============================================================
+# Nu mai folosim GOOD_IDS / SURPLUS_IDS / PATHOLOGIC_IDS / WRONG_IDS.
+# Pentru fiecare imagine rulam toate modurile si alegem automat rezultatul
+# cu scorul cel mai bun.
 
-GOOD_IDS = {
-    2, 3, 4, 5, 6, 9, 10, 11, 12, 13,
-    27, 29, 33, 35, 36, 41, 43, 50, 51
-}
-
-SURPLUS_IDS = {
-    1, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-    26, 28, 32, 34, 47, 48, 49, 58
-}
-
-WRONG_IDS = {
-    0
-}
-
-# Le tratăm ca pleură potențial patologică:
-# poate avea întreruperi, bucăți separate, noduli, grosime locală mai mare.
-PATHOLOGIC_IDS = {
-    7, 8, 14, 15, 16, 30, 31, 37, 38, 39,
-    40, 42, 44, 45, 46, 52, 53, 54, 55,
-    56, 57, 59, 60, 61
-}
-
-
-def get_image_mode(idx):
-    if idx in WRONG_IDS:
-        return "wrong"
-
-    if idx in SURPLUS_IDS:
-        return "surplus"
-
-    if idx in PATHOLOGIC_IDS:
-        return "pathologic"
-
-    return "normal"
+AUTO_MODES = ["normal", "surplus", "pathologic"]
 
 
 # ============================================================
@@ -456,6 +426,174 @@ def Binarize(Image, tresh):
     return binarized
 
 
+def ComputeAdaptivePleuraThreshold(img, mode="normal"):
+    """
+    Prag mai stabil decat np.max(img) - 10.
+
+    In codul vechi, daca exista un singur pixel foarte luminos, pragul devenea prea sus
+    si se pierdeau fragmente din pleura. Aici combinam Yen cu percentile.
+
+    - surplus: prag mai strict, ca sa reduca marcajele in plus
+    - pathologic: prag mai permisiv, ca sa pastreze bucati intrerupte/neregulate
+    - normal: balans intre cele doua
+    """
+    img_u = to_gray_uint8(img)
+
+    if img_u.size == 0:
+        return 245.0
+
+    values = img_u.reshape(-1).astype(np.float32)
+    values = values[np.isfinite(values)]
+
+    if len(values) == 0:
+        return 245.0
+
+    try:
+        yen_thr = float(threshold_yen(img_u))
+    except Exception:
+        yen_thr = float(np.percentile(values, 92))
+
+    if mode == "surplus":
+        percentile_thr = float(np.percentile(values, 95.0))
+        offset = 2.0
+    elif mode == "pathologic":
+        percentile_thr = float(np.percentile(values, 88.0))
+        offset = -3.0
+    else:
+        percentile_thr = float(np.percentile(values, 92.0))
+        offset = 0.0
+
+    low_guard = float(np.percentile(values, 72.0))
+    high_guard = float(np.percentile(values, 99.2))
+
+    threshold = 0.55 * yen_thr + 0.45 * percentile_thr + offset
+    threshold = max(low_guard, min(high_guard, threshold))
+
+    # Evitam praguri extreme.
+    threshold = max(5.0, min(250.0, threshold))
+
+    return threshold
+
+
+def CleanFinalPleuraMask(mask, image_shape, mode="normal"):
+    """
+    Curatare conservatoare a mastii finale.
+
+    Scop:
+    - elimina fragmente minuscule sau evident verticale;
+    - in modul surplus pastreaza mai strict componentele lungi/subtiri;
+    - in modul pathologic permite mai multe componente separate.
+    """
+    if mask is None or mask.size == 0:
+        return mask
+
+    h, w = image_shape[:2]
+    mask_bin = (mask > 0).astype(np.uint8) * 255
+
+    if np.count_nonzero(mask_bin) < 5:
+        return mask_bin
+
+    if mode == "surplus":
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
+        mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN, open_kernel)
+    elif mode == "pathologic":
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
+        mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, close_kernel)
+    else:
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 2))
+        mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, close_kernel)
+
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        (mask_bin > 0).astype(np.uint8),
+        connectivity=8
+    )
+
+    if n_labels <= 1:
+        return mask_bin
+
+    candidates = []
+
+    for label in range(1, n_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        bw = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+
+        if area < 8:
+            continue
+
+        width_frac = bw / max(w, 1)
+        height_frac = bh / max(h, 1)
+        area_frac = area / max(h * w, 1)
+        aspect = bw / max(bh, 1)
+        y_center = (y + bh / 2.0) / max(h, 1)
+
+        if mode == "surplus":
+            min_width_frac = 0.020
+            max_height_frac = 0.22
+            max_area_frac = 0.12
+            min_aspect = 1.35
+            max_keep = 3
+        elif mode == "pathologic":
+            min_width_frac = 0.006
+            max_height_frac = 0.55
+            max_area_frac = 0.25
+            min_aspect = 0.45
+            max_keep = 10
+        else:
+            min_width_frac = 0.012
+            max_height_frac = 0.38
+            max_area_frac = 0.18
+            min_aspect = 0.75
+            max_keep = 5
+
+        if width_frac < min_width_frac:
+            continue
+
+        if height_frac > max_height_frac:
+            continue
+
+        if area_frac > max_area_frac:
+            continue
+
+        if aspect < min_aspect:
+            continue
+
+        # Evitam componente foarte aproape de margini, dar nu le eliminam agresiv.
+        y_score = 1.0
+        if y_center < 0.05 or y_center > 0.95:
+            y_score = 0.35
+
+        score = (
+            2.6 * min(1.0, width_frac / 0.55)
+            + 1.2 * min(1.0, aspect / 8.0)
+            + 0.7 * y_score
+            - 1.6 * height_frac
+            - 2.0 * area_frac
+        )
+
+        candidates.append((score, label, max_keep))
+
+    if len(candidates) == 0:
+        # Daca filtrarea a fost prea dura, pastram masca initiala ca sa nu pierdem pleura.
+        return mask_bin
+
+    candidates = sorted(candidates, key=lambda item: item[0], reverse=True)
+    max_keep = candidates[0][2]
+    keep_labels = [label for _, label, _ in candidates[:max_keep]]
+
+    cleaned = np.zeros_like(mask_bin)
+
+    for label in keep_labels:
+        cleaned[labels == label] = 255
+
+    if np.count_nonzero(cleaned) < 5:
+        return mask_bin
+
+    return cleaned
+
+
 def IdnetifyPoly(X_, Y_, order):
     X_ = np.asarray(X_, dtype=np.float64)
     Y_ = np.asarray(Y_, dtype=np.float64)
@@ -838,6 +976,324 @@ def FinalMaskLooksPlausible(mask, image_shape, mode="normal"):
             return False
 
     return True
+
+
+# ============================================================
+# AUTOMATIC MODE SELECTION
+# ============================================================
+
+def ComputeMaskMetrics(mask, image_shape):
+    h, w = image_shape[:2]
+
+    metrics = {
+        "has_pixels": False,
+        "width_frac": 0.0,
+        "height_frac": 0.0,
+        "area_frac": 0.0,
+        "coverage": 0.0,
+        "continuity": 0.0,
+        "y_center_frac": 0.0,
+        "median_thickness": 0.0,
+        "thickness_iqr": 0.0,
+        "thickness_var_norm": 0.0,
+        "components_count": 0,
+        "slope": 999.0
+    }
+
+    if mask is None or mask.size == 0:
+        return metrics
+
+    mask_bin = (mask > 0).astype(np.uint8)
+    ys, xs = np.where(mask_bin > 0)
+
+    if len(xs) < 5:
+        return metrics
+
+    metrics["has_pixels"] = True
+
+    x_min = int(np.min(xs))
+    x_max = int(np.max(xs))
+    y_min = int(np.min(ys))
+    y_max = int(np.max(ys))
+
+    width = x_max - x_min + 1
+    height = y_max - y_min + 1
+    area = int(np.count_nonzero(mask_bin))
+
+    metrics["width_frac"] = width / max(w, 1)
+    metrics["height_frac"] = height / max(h, 1)
+    metrics["area_frac"] = area / max(h * w, 1)
+    metrics["y_center_frac"] = float(np.median(ys)) / max(h, 1)
+
+    unique_x = np.unique(xs)
+    metrics["coverage"] = len(unique_x) / max(w, 1)
+    metrics["continuity"] = len(unique_x) / max(width, 1)
+
+    thicknesses = []
+    centers_x = []
+    centers_y = []
+
+    for x in unique_x:
+        col_ys = ys[xs == x]
+
+        if len(col_ys) == 0:
+            continue
+
+        y1 = int(np.min(col_ys))
+        y2 = int(np.max(col_ys))
+
+        thicknesses.append(y2 - y1 + 1)
+        centers_x.append(x)
+        centers_y.append((y1 + y2) / 2.0)
+
+    if len(thicknesses) > 0:
+        thicknesses = np.asarray(thicknesses, dtype=np.float64)
+
+        med = float(np.median(thicknesses))
+        q25 = float(np.percentile(thicknesses, 25))
+        q75 = float(np.percentile(thicknesses, 75))
+
+        metrics["median_thickness"] = med
+        metrics["thickness_iqr"] = q75 - q25
+        metrics["thickness_var_norm"] = (q75 - q25) / max(med, 1.0)
+
+    try:
+        n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            mask_bin,
+            connectivity=8
+        )
+        metrics["components_count"] = max(0, n_labels - 1)
+    except Exception:
+        metrics["components_count"] = 999
+
+    try:
+        if len(centers_x) >= 2 and len(np.unique(centers_x)) >= 2:
+            coeff = np.polyfit(
+                np.asarray(centers_x, dtype=np.float64),
+                np.asarray(centers_y, dtype=np.float64),
+                1
+            )
+            metrics["slope"] = abs(float(coeff[0]))
+    except Exception:
+        metrics["slope"] = 999.0
+
+    return metrics
+
+
+def ScorePleuraResult(result, image_shape, mode):
+    mask = result["display_mask"]
+    m = ComputeMaskMetrics(mask, image_shape)
+
+    if not m["has_pixels"]:
+        m["score"] = -999.0
+        m["accepted"] = False
+        m["suspect"] = True
+        m["reason"] = "empty_mask"
+        m["mode"] = mode
+        m["interruptions_count"] = 0
+        m["nodules_count"] = 0
+        m["raw_components_count"] = 0
+        return -999.0, m
+
+    interruptions = result.get("interruptions", [])
+    nodules = result.get("nodules", [])
+    components = result.get("components", [])
+
+    coverage = m["coverage"]
+    continuity = m["continuity"]
+    height_frac = m["height_frac"]
+    area_frac = m["area_frac"]
+    width_frac = m["width_frac"]
+    y_center_frac = m["y_center_frac"]
+    thickness_var_norm = m["thickness_var_norm"]
+    components_count = m["components_count"]
+    slope = m["slope"]
+
+    score = 0.0
+    reasons = []
+
+    # Pleura trebuie sa fie extinsa orizontal.
+    score += 4.0 * min(1.0, coverage / 0.55)
+    score += 2.0 * min(1.0, width_frac / 0.65)
+    score += 1.2 * min(1.0, continuity)
+
+    # Pozitie verticala plauzibila.
+    if 0.10 <= y_center_frac <= 0.85:
+        score += 1.0
+    else:
+        score -= 2.0
+        reasons.append("bad_vertical_position")
+
+    # Limite diferite in functie de ipoteza de lucru.
+    if mode == "surplus":
+        max_height = 0.28
+        max_area = 0.16
+    elif mode == "pathologic":
+        max_height = 0.62
+        max_area = 0.28
+    else:
+        max_height = 0.42
+        max_area = 0.22
+
+    if height_frac <= max_height:
+        score += 1.0
+    else:
+        score -= 5.0 * (height_frac - max_height)
+        reasons.append("too_tall")
+
+    if area_frac <= max_area:
+        score += 1.0
+    else:
+        score -= 6.0 * (area_frac - max_area)
+        reasons.append("too_large_area")
+
+    # Penalizare pentru surplus.
+    if mode == "surplus":
+        score -= 3.5 * area_frac
+        score -= 1.8 * height_frac
+    else:
+        score -= 1.5 * area_frac
+
+    # Penalizare componente multiple. Pathologic permite mai multe bucati.
+    if mode == "pathologic":
+        score -= 0.08 * max(0, components_count - 1)
+    elif mode == "surplus":
+        score -= 0.35 * max(0, components_count - 1)
+    else:
+        score -= 0.20 * max(0, components_count - 1)
+
+    # Penalizare variatie de grosime. Pathologic este mai permisiv.
+    if mode == "pathologic":
+        score -= 0.30 * min(3.0, thickness_var_norm)
+    else:
+        score -= 0.85 * min(3.0, thickness_var_norm)
+
+    # Panta mare poate indica artefact sau contur gresit.
+    if mode == "pathologic":
+        max_slope = 2.2
+    else:
+        max_slope = 1.4
+
+    if slope > max_slope:
+        score -= 1.5
+        reasons.append("large_slope")
+
+    # Bonus mic pentru cazuri patologice daca apar semnale morfologice.
+    if mode == "pathologic":
+        if len(interruptions) > 0:
+            score += 0.15 * min(4, len(interruptions))
+
+        if len(nodules) > 0:
+            score += 0.10 * min(4, len(nodules))
+
+    accepted = True
+
+    if coverage < 0.06:
+        accepted = False
+        reasons.append("low_coverage")
+
+    if width_frac < 0.06:
+        accepted = False
+        reasons.append("low_width")
+
+    if area_frac < 0.00005:
+        accepted = False
+        reasons.append("too_few_pixels")
+
+    if height_frac > 0.70:
+        accepted = False
+        reasons.append("huge_height")
+
+    if area_frac > 0.35:
+        accepted = False
+        reasons.append("huge_area")
+
+    if score < 1.0:
+        accepted = False
+        reasons.append("low_score")
+
+    suspect = False
+
+    if not accepted:
+        suspect = True
+
+    if score < 2.2:
+        suspect = True
+
+    if mode != "pathologic" and components_count > 5:
+        suspect = True
+
+    if mode != "pathologic" and thickness_var_norm > 2.0:
+        suspect = True
+
+    if len(reasons) == 0:
+        reason = "ok"
+    else:
+        reason = ",".join(sorted(set(reasons)))
+
+    m["score"] = float(score)
+    m["accepted"] = bool(accepted)
+    m["suspect"] = bool(suspect)
+    m["reason"] = reason
+    m["mode"] = mode
+    m["interruptions_count"] = len(interruptions)
+    m["nodules_count"] = len(nodules)
+    m["raw_components_count"] = len(components)
+
+    return score, m
+
+
+def RunAutomaticPleuraDetection(crop_Image_rgb, one_pixel=ONE_PIXEL_FALLBACK):
+    candidates = []
+    mode_errors = []
+
+    for mode in AUTO_MODES:
+        try:
+            interpreted_Image = crop_Image_rgb.copy()
+
+            result = ExtractPleuralLine(
+                crop_Image_rgb,
+                interpreted_Image,
+                mode=mode,
+                one_pixel=one_pixel
+            )
+
+            final_contours = result.get("final_contours", [])
+
+            if final_contours is None or len(final_contours) == 0:
+                raise ValueError("Nu s-a extras niciun contur final in modul " + mode)
+
+            score, metrics = ScorePleuraResult(
+                result,
+                crop_Image_rgb.shape,
+                mode
+            )
+
+            candidates.append({
+                "mode": mode,
+                "result": result,
+                "score": score,
+                "metrics": metrics
+            })
+
+        except Exception as e:
+            mode_errors.append({
+                "mode": mode,
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            })
+
+    if len(candidates) == 0:
+        msg = "Toate modurile automate au esuat."
+
+        for err in mode_errors:
+            msg += "\n[" + err["mode"] + "] " + err["error"]
+
+        raise ValueError(msg)
+
+    best = max(candidates, key=lambda x: x["score"])
+
+    return best, candidates, mode_errors
 
 
 # ============================================================
@@ -1332,7 +1788,7 @@ def BuildDisplayPleuraMask(components, image_shape, mode="normal"):
         connection_thickness = 2
 
     elif mode == "pathologic":
-        # Nu unim agresiv: golurile pot fi întreruperi reale.
+        # Nu unim agresiv: golurile pot fi intreruperi reale.
         max_gap = max(18, int(0.030 * w))
         max_vertical_diff = max(28, int(0.060 * h))
         connection_thickness = 2
@@ -1386,6 +1842,8 @@ def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=O
     nr_of_colors = 20
     img = ReduceColorPalette(img, nr_of_colors)
 
+    # Pragul vechi a mers mai bine pe setul actual.
+    # Pentru moment nu schimbam binarizarea; ne axam doar pe identificare.
     tresh = np.max(img) - 10
     img = Binarize(img, tresh)
     img = (1 - img).astype(np.uint8)
@@ -1583,6 +2041,7 @@ def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=O
         mode=mode
     )
 
+
     final_contours = FindAllContoursFromMask(display_mask)
 
     if len(final_contours) == 0:
@@ -1773,6 +2232,51 @@ def make_contact_sheet(image_folder, output_path, cols=8, thumb_w=260, thumb_h=1
     print("[CONTACT_SHEET] Salvat:", output_path)
 
 
+def write_metrics_file(path, metrics):
+    with open(path, "w", encoding="utf-8") as f:
+        for key in sorted(metrics.keys()):
+            f.write(str(key) + "=" + str(metrics[key]) + "\n")
+
+
+def write_auto_mode_csv(path, rows):
+    if len(rows) == 0:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("")
+        return
+
+    keys = [
+        "image",
+        "chosen_mode",
+        "score",
+        "accepted",
+        "suspect",
+        "reason",
+        "coverage",
+        "width_frac",
+        "height_frac",
+        "area_frac",
+        "continuity",
+        "y_center_frac",
+        "median_thickness",
+        "thickness_iqr",
+        "thickness_var_norm",
+        "components_count",
+        "interruptions_count",
+        "nodules_count"
+    ]
+
+    def esc(value):
+        s = "" if value is None else str(value)
+        if "," in s or "\n" in s or '"' in s:
+            s = '"' + s.replace('"', '""') + '"'
+        return s
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(",".join(keys) + "\n")
+        for row in rows:
+            f.write(",".join(esc(row.get(k, "")) for k in keys) + "\n")
+
+
 # ============================================================
 # MAIN BATCH
 # ============================================================
@@ -1784,6 +2288,7 @@ def main():
     all_masks_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_MASKS"))
     all_interruption_masks_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_INTERRUPTION_MASKS"))
     all_nodule_masks_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_NODULE_MASKS"))
+    all_mode_results_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_MODE_RESULTS"))
     suspect_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "SUSPECT_RESULTS"))
     error_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ERRORS"))
 
@@ -1796,12 +2301,15 @@ def main():
 
     interruption_report = []
     nodule_report = []
+    auto_mode_report = []
 
     print("\n" + "=" * 70)
-    print("BATCH PLEURA - CU NODULI SI INTRERUPERI")
+    print("BATCH PLEURA - MOD AUTOMAT FARA HARDCODARE")
     print("Input :", INPUT_DIR)
     print("Output contururi:", all_contours_dir)
     print("Output diagnostic:", all_diagnostic_dir)
+    print("Output toate modurile:", all_mode_results_dir)
+    print("Moduri automate:", AUTO_MODES)
     print("=" * 70 + "\n")
 
     for idx in range(START_IDX, END_IDX + 1):
@@ -1817,8 +2325,6 @@ def main():
             continue
 
         try:
-            mode = get_image_mode(idx)
-
             orig_Image = io.imread(img_path)
 
             if orig_Image.ndim == 2:
@@ -1837,14 +2343,16 @@ def main():
                 crop_Image = cv2.cvtColor(crop_Image, cv2.COLOR_RGB2GRAY)
 
             crop_Image_rgb = cv2.cvtColor(crop_Image, cv2.COLOR_GRAY2RGB)
-            interpreted_Image = crop_Image_rgb.copy()
 
-            result = ExtractPleuralLine(
+            best_candidate, all_candidates, mode_errors = RunAutomaticPleuraDetection(
                 crop_Image_rgb,
-                interpreted_Image,
-                mode=mode,
                 one_pixel=one_pixel
             )
+
+            mode = best_candidate["mode"]
+            result = best_candidate["result"]
+            auto_score = best_candidate["score"]
+            auto_metrics = best_candidate["metrics"]
 
             final_contours = result["final_contours"]
             components = result["components"]
@@ -1855,6 +2363,83 @@ def main():
 
             if final_contours is None or len(final_contours) == 0:
                 raise ValueError("Nu s-a extras niciun contur final.")
+
+            # ------------------------------------------------
+            # Salvam rezultatele tuturor modurilor pentru audit.
+            # ------------------------------------------------
+            img_modes_dir = ensure_dir(
+                os.path.join(
+                    all_mode_results_dir,
+                    format(idx, "02d")
+                )
+            )
+
+            for cand in all_candidates:
+                cand_mode = cand["mode"]
+                cand_result = cand["result"]
+                cand_metrics = cand["metrics"]
+
+                cand_dir = ensure_dir(
+                    os.path.join(
+                        img_modes_dir,
+                        cand_mode
+                    )
+                )
+
+                cand_overlay = draw_final_overlay(
+                    crop_Image_rgb,
+                    cand_result["final_contours"]
+                )
+
+                cand_diagnostic = draw_diagnostic_overlay(
+                    crop_Image_rgb,
+                    cand_result["final_contours"],
+                    cand_result["interruptions"],
+                    cand_result["nodules"]
+                )
+
+                cand_components_overlay = draw_components_overlay(
+                    crop_Image_rgb,
+                    cand_result["components"]
+                )
+
+                save_rgb(
+                    os.path.join(cand_dir, "overlay.png"),
+                    cand_overlay
+                )
+
+                save_rgb(
+                    os.path.join(cand_dir, "diagnostic.png"),
+                    cand_diagnostic
+                )
+
+                save_rgb(
+                    os.path.join(cand_dir, "components.png"),
+                    cand_components_overlay
+                )
+
+                cv2.imwrite(
+                    os.path.join(cand_dir, "mask.png"),
+                    cand_result["display_mask"]
+                )
+
+                cv2.imwrite(
+                    os.path.join(cand_dir, "component_mask.png"),
+                    cand_result["component_mask"]
+                )
+
+                write_metrics_file(
+                    os.path.join(cand_dir, "metrics.txt"),
+                    cand_metrics
+                )
+
+            if len(mode_errors) > 0:
+                with open(os.path.join(img_modes_dir, "mode_errors.txt"), "w", encoding="utf-8") as f:
+                    for err in mode_errors:
+                        f.write("MODE: " + str(err["mode"]) + "\n")
+                        f.write("ERROR: " + str(err["error"]) + "\n")
+                        f.write(err["traceback"])
+                        f.write("\n" + "=" * 60 + "\n")
 
             # -----------------------------
             # Overlay simplu contur
@@ -1946,18 +2531,18 @@ def main():
 
             cv2.imwrite(nodule_mask_path, nodule_mask)
 
-            is_plausible = FinalMaskLooksPlausible(
-                display_mask,
-                crop_Image.shape,
-                mode=mode
-            )
+            # ------------------------------------------------
+            # Decizia de suspect nu mai depinde de imagine wrong.
+            # Este complet automata, pe baza scorului si metricilor.
+            # ------------------------------------------------
+            is_plausible = bool(auto_metrics["accepted"])
 
-            if mode == "wrong":
+            if auto_metrics["suspect"]:
                 is_plausible = False
 
             if not is_plausible:
                 suspect_count += 1
-                suspect_images.append((img_name, "Contur suspect geometric sau imagine marcata wrong"))
+                suspect_images.append((img_name, "Contur suspect automat: " + str(auto_metrics["reason"])))
 
                 suspect_path = os.path.join(
                     suspect_dir,
@@ -1991,6 +2576,29 @@ def main():
                     }
                 )
 
+            auto_mode_report.append(
+                {
+                    "image": img_name,
+                    "chosen_mode": mode,
+                    "score": auto_score,
+                    "accepted": auto_metrics["accepted"],
+                    "suspect": auto_metrics["suspect"],
+                    "reason": auto_metrics["reason"],
+                    "coverage": auto_metrics["coverage"],
+                    "width_frac": auto_metrics["width_frac"],
+                    "height_frac": auto_metrics["height_frac"],
+                    "area_frac": auto_metrics["area_frac"],
+                    "continuity": auto_metrics["continuity"],
+                    "y_center_frac": auto_metrics["y_center_frac"],
+                    "median_thickness": auto_metrics["median_thickness"],
+                    "thickness_iqr": auto_metrics["thickness_iqr"],
+                    "thickness_var_norm": auto_metrics["thickness_var_norm"],
+                    "components_count": auto_metrics["components_count"],
+                    "interruptions_count": auto_metrics["interruptions_count"],
+                    "nodules_count": auto_metrics["nodules_count"]
+                }
+            )
+
             success_count += 1
 
             print("  [OK] Salvat:", output_path)
@@ -1999,7 +2607,12 @@ def main():
             print("  final_contours =", len(final_contours))
             print("  intreruperi =", len(interruptions))
             print("  noduli =", len(nodules))
-            print("  mode =", mode)
+            print("  mode ales automat =", mode)
+            print("  auto_score =", auto_score)
+            print("  auto_reason =", auto_metrics["reason"])
+            print("  coverage =", auto_metrics["coverage"])
+            print("  area_frac =", auto_metrics["area_frac"])
+            print("  height_frac =", auto_metrics["height_frac"])
 
         except Exception as e:
             fail_count += 1
@@ -2070,6 +2683,43 @@ def main():
     summary_path = os.path.join(OUTPUT_ROOT, "summary.txt")
     interruption_report_path = os.path.join(OUTPUT_ROOT, "interruptions_report.txt")
     nodule_report_path = os.path.join(OUTPUT_ROOT, "nodules_report.txt")
+    auto_mode_report_path = os.path.join(OUTPUT_ROOT, "auto_mode_report.txt")
+    auto_mode_csv_path = os.path.join(OUTPUT_ROOT, "auto_mode_report.csv")
+
+    write_auto_mode_csv(auto_mode_csv_path, auto_mode_report)
+
+    with open(auto_mode_report_path, "w", encoding="utf-8") as f:
+        f.write("MOD ALES AUTOMAT PER IMAGINE\n")
+        f.write("=" * 70 + "\n")
+        f.write("Moduri disponibile: " + str(AUTO_MODES) + "\n\n")
+
+        if len(auto_mode_report) == 0:
+            f.write("Nu exista rezultate automate.\n")
+        else:
+            for item in auto_mode_report:
+                f.write(
+                    "Imagine: "
+                    + str(item["image"])
+                    + " | mode="
+                    + str(item["chosen_mode"])
+                    + " | score={:.4f}".format(item["score"])
+                    + " | accepted="
+                    + str(item["accepted"])
+                    + " | suspect="
+                    + str(item["suspect"])
+                    + " | reason="
+                    + str(item["reason"])
+                    + " | coverage={:.4f}".format(item["coverage"])
+                    + " | area_frac={:.6f}".format(item["area_frac"])
+                    + " | height_frac={:.4f}".format(item["height_frac"])
+                    + " | components="
+                    + str(item["components_count"])
+                    + " | intreruperi="
+                    + str(item["interruptions_count"])
+                    + " | noduli="
+                    + str(item["nodules_count"])
+                    + "\n"
+                )
 
     with open(interruption_report_path, "w", encoding="utf-8") as f:
         f.write("INTRERUPERI CANDIDATE\n")
@@ -2116,7 +2766,7 @@ def main():
                 )
 
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("BATCH PLEURA - CU NODULI SI INTRERUPERI\n")
+        f.write("BATCH PLEURA - MOD AUTOMAT FARA HARDCODARE\n")
         f.write("=" * 50 + "\n")
         f.write("Interval imagini: " + str(START_IDX) + "-" + str(END_IDX) + "\n")
         f.write("Reusite: " + str(success_count) + "\n")
@@ -2124,6 +2774,9 @@ def main():
         f.write("Suspecte: " + str(suspect_count) + "\n")
         f.write("Total intreruperi candidate: " + str(len(interruption_report)) + "\n")
         f.write("Total noduli candidati: " + str(len(nodule_report)) + "\n\n")
+
+        f.write("Moduri automate folosite:\n")
+        f.write(str(AUTO_MODES) + "\n\n")
 
         f.write("Folder contururi:\n")
         f.write(all_contours_dir + "\n\n")
@@ -2143,6 +2796,9 @@ def main():
         f.write("Folder masti noduli:\n")
         f.write(all_nodule_masks_dir + "\n\n")
 
+        f.write("Folder toate modurile:\n")
+        f.write(all_mode_results_dir + "\n\n")
+
         f.write("Folder suspecte:\n")
         f.write(suspect_dir + "\n\n")
 
@@ -2161,23 +2817,46 @@ def main():
         f.write("Contact sheet suspecte:\n")
         f.write(suspect_sheet_path + "\n\n")
 
+        f.write("Raport mod automat TXT:\n")
+        f.write(auto_mode_report_path + "\n\n")
+
+        f.write("Raport mod automat CSV:\n")
+        f.write(auto_mode_csv_path + "\n\n")
+
         f.write("Raport intreruperi:\n")
         f.write(interruption_report_path + "\n\n")
 
         f.write("Raport noduli:\n")
         f.write(nodule_report_path + "\n\n")
 
-        f.write("GOOD_IDS:\n")
-        f.write(str(sorted(GOOD_IDS)) + "\n\n")
+        f.write("MOD ALES AUTOMAT PER IMAGINE:\n")
 
-        f.write("SURPLUS_IDS:\n")
-        f.write(str(sorted(SURPLUS_IDS)) + "\n\n")
+        for item in auto_mode_report:
+            f.write(
+                "  "
+                + str(item["image"])
+                + " | mode="
+                + str(item["chosen_mode"])
+                + " | score={:.4f}".format(item["score"])
+                + " | accepted="
+                + str(item["accepted"])
+                + " | suspect="
+                + str(item["suspect"])
+                + " | reason="
+                + str(item["reason"])
+                + " | coverage={:.4f}".format(item["coverage"])
+                + " | area_frac={:.6f}".format(item["area_frac"])
+                + " | height_frac={:.4f}".format(item["height_frac"])
+                + " | components="
+                + str(item["components_count"])
+                + " | intreruperi="
+                + str(item["interruptions_count"])
+                + " | noduli="
+                + str(item["nodules_count"])
+                + "\n"
+            )
 
-        f.write("PATHOLOGIC_IDS:\n")
-        f.write(str(sorted(PATHOLOGIC_IDS)) + "\n\n")
-
-        f.write("WRONG_IDS:\n")
-        f.write(str(sorted(WRONG_IDS)) + "\n\n")
+        f.write("\n")
 
         if len(failed_images) > 0:
             f.write("Imagini esuate:\n")
@@ -2198,7 +2877,9 @@ def main():
     print("Total noduli candidati:", len(nodule_report))
     print("Contururi:", all_contours_dir)
     print("Diagnostic:", all_diagnostic_dir)
+    print("Toate modurile:", all_mode_results_dir)
     print("Contact sheet diagnostic:", diagnostic_sheet_path)
+    print("Raport automat CSV:", auto_mode_csv_path)
     print("Rezumat:", summary_path)
     print("=" * 70)
 
