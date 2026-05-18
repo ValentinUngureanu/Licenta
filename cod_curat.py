@@ -2,6 +2,7 @@ import os
 import re
 import math
 import traceback
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -25,14 +26,34 @@ END_IDX = 61
 
 ONE_PIXEL_FALLBACK = 0.07
 
+MAX_PIXEL_VALUE = 255
+DEFAULT_BINARY_THRESHOLD = 128
+BINARY_THRESHOLD = 110
+MIN_BORDER_AREA = 1000
+SMALL_CONTOUR_AREA = 30
+PIXEL_CONTOUR_AREA = 20
+LEFT_MARGIN_SEARCH_LIMIT = 100
+DEFAULT_LEFT_BOUND = 25
+CROP_RIGHT_MARGIN = 20
+MIN_CROP_SIZE = 30
+HORIZONTAL_KERNEL_SIZE = (2, 1)
+MORPH_ITERATIONS = 3
+PLEURA_COLOR_COUNT = 20
+PLEURA_THRESHOLD_OFFSET = 10
+DEFAULT_DEVIATION = 50
+SECONDARY_INITIAL_DEVIATION = 30
+SECONDARY_LATERAL_DEVIATION = 100
+MAX_FIT_DEVIATION = 300
+
 
 AUTO_MODES = ["normal", "surplus", "pathologic"]
 
 
+@dataclass
 class Point:
-    x = 0.0
-    y = 0.0
-    dist = 0.0
+    x: float = 0.0
+    y: float = 0.0
+    dist: float = 0.0
 
 
 def ensure_dir(path):
@@ -47,18 +68,7 @@ def save_rgb(path, img_rgb):
         cv2.imwrite(path, cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
 
 
-def to_gray_uint8(img):
-    if img.ndim == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-    if img.dtype != np.uint8:
-        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
-        img = img.astype(np.uint8)
-
-    return img
-
-
-def CropBorder(orig_Image):
+def crop_border(orig_Image):
     orig_img = orig_Image.copy()
 
     if orig_img.ndim == 2:
@@ -66,8 +76,8 @@ def CropBorder(orig_Image):
     else:
         gray_Image = cv2.cvtColor(orig_img, cv2.COLOR_RGB2GRAY)
 
-    _, img_bin = cv2.threshold(gray_Image, 128, 255, cv2.THRESH_BINARY)
-    _, threshold = cv2.threshold(gray_Image, 110, 255, cv2.THRESH_BINARY)
+    _, img_bin = cv2.threshold(gray_Image, DEFAULT_BINARY_THRESHOLD, MAX_PIXEL_VALUE, cv2.THRESH_BINARY)
+    _, threshold = cv2.threshold(gray_Image, BINARY_THRESHOLD, MAX_PIXEL_VALUE, cv2.THRESH_BINARY)
 
     contours, _ = cv2.findContours(
         threshold,
@@ -78,7 +88,7 @@ def CropBorder(orig_Image):
     for cnt in contours:
         area = cv2.contourArea(cnt)
 
-        if area > 1000:
+        if area > MIN_BORDER_AREA:
             approx = cv2.approxPolyDP(
                 cnt,
                 0.01 * cv2.arcLength(cnt, True),
@@ -88,7 +98,7 @@ def CropBorder(orig_Image):
             if len(approx) == 4:
                 cv2.drawContours(orig_img, [approx], 0, 255, -1)
 
-    _, threshold = cv2.threshold(gray_Image, 110, 255, cv2.THRESH_BINARY)
+    _, threshold = cv2.threshold(gray_Image, BINARY_THRESHOLD, MAX_PIXEL_VALUE, cv2.THRESH_BINARY)
 
     contours, _ = cv2.findContours(
         threshold,
@@ -101,7 +111,7 @@ def CropBorder(orig_Image):
     for cnt in contours:
         area = cv2.contourArea(cnt)
 
-        if area > 1000:
+        if area > MIN_BORDER_AREA:
             approx = cv2.approxPolyDP(
                 cnt,
                 0.01 * cv2.arcLength(cnt, True),
@@ -119,17 +129,17 @@ def CropBorder(orig_Image):
     if white_pixels.shape[1] == 0:
         last_small = np.array([])
     else:
-        last_small = white_pixels[1, white_pixels[1] < 100]
+        last_small = white_pixels[1, white_pixels[1] < LEFT_MARGIN_SEARCH_LIMIT]
 
     if len(white_pixels[1]) == 0 or len(last_small) == 0:
-        left_bound = 25
+        left_bound = DEFAULT_LEFT_BOUND
     else:
         left_bound = int(last_small[-1])
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
 
-        if area < 30:
+        if area < SMALL_CONTOUR_AREA:
             approx = cv2.approxPolyDP(
                 cnt,
                 0.00001 * cv2.arcLength(cnt, True),
@@ -139,7 +149,7 @@ def CropBorder(orig_Image):
             if len(approx) == 4:
                 cv2.drawContours(orig_img, [approx], 0, 255, -1)
 
-    _, threshold = cv2.threshold(gray_Image, 110, 255, cv2.THRESH_BINARY)
+    _, threshold = cv2.threshold(gray_Image, BINARY_THRESHOLD, MAX_PIXEL_VALUE, cv2.THRESH_BINARY)
 
     contours, _ = cv2.findContours(
         threshold,
@@ -152,7 +162,7 @@ def CropBorder(orig_Image):
     for cnt in contours:
         area = cv2.contourArea(cnt)
 
-        if area < 30:
+        if area < SMALL_CONTOUR_AREA:
             approx = cv2.approxPolyDP(
                 cnt,
                 0.00001 * cv2.arcLength(cnt, True),
@@ -165,10 +175,10 @@ def CropBorder(orig_Image):
             if len(approx) == 2:
                 cv2.drawContours(black, [approx], 0, 255, -1)
 
-    hori_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+    hori_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, HORIZONTAL_KERNEL_SIZE)
 
-    img_temp2 = cv2.erode(black, hori_kernel, iterations=3)
-    horizontal_lines_img = cv2.dilate(img_temp2, hori_kernel, iterations=3)
+    img_temp2 = cv2.erode(black, hori_kernel, iterations=MORPH_ITERATIONS)
+    horizontal_lines_img = cv2.dilate(img_temp2, hori_kernel, iterations=MORPH_ITERATIONS)
 
     bar_image = horizontal_lines_img
 
@@ -194,7 +204,7 @@ def CropBorder(orig_Image):
     if first_bar_pixel == 0 or last_bar_pixel == 0:
         return gray_Image.copy()
 
-    x2 = int(bar_pos - 20)
+    x2 = int(bar_pos - CROP_RIGHT_MARGIN)
 
     if x2 <= left_bound:
         return gray_Image.copy()
@@ -204,13 +214,13 @@ def CropBorder(orig_Image):
         left_bound:x2
     ].copy()
 
-    if crop_img.size == 0 or crop_img.shape[0] < 30 or crop_img.shape[1] < 30:
+    if crop_img.size == 0 or crop_img.shape[0] < MIN_CROP_SIZE or crop_img.shape[1] < MIN_CROP_SIZE:
         return gray_Image.copy()
 
     return crop_img
 
 
-def PixelConverter(orig_Image):
+def pixel_converter(orig_Image):
     try:
         orig_img = orig_Image.copy()
 
@@ -226,7 +236,7 @@ def PixelConverter(orig_Image):
             cv2.THRESH_BINARY | cv2.THRESH_OTSU
         )
 
-        _, threshold = cv2.threshold(gray_Image, 110, 255, cv2.THRESH_BINARY)
+        _, threshold = cv2.threshold(gray_Image, BINARY_THRESHOLD, MAX_PIXEL_VALUE, cv2.THRESH_BINARY)
 
         contours, _ = cv2.findContours(
             threshold,
@@ -239,7 +249,7 @@ def PixelConverter(orig_Image):
         for cnt in contours:
             area = cv2.contourArea(cnt)
 
-            if area < 20:
+            if area < PIXEL_CONTOUR_AREA:
                 approx = cv2.approxPolyDP(
                     cnt,
                     0.00001 * cv2.arcLength(cnt, True),
@@ -252,10 +262,10 @@ def PixelConverter(orig_Image):
                 if len(approx) == 2:
                     cv2.drawContours(black, [approx], 0, 255, -1)
 
-        hori_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+        hori_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, HORIZONTAL_KERNEL_SIZE)
 
-        img_temp2 = cv2.erode(black, hori_kernel, iterations=3)
-        horizontal_lines_img = cv2.dilate(img_temp2, hori_kernel, iterations=3)
+        img_temp2 = cv2.erode(black, hori_kernel, iterations=MORPH_ITERATIONS)
+        horizontal_lines_img = cv2.dilate(img_temp2, hori_kernel, iterations=MORPH_ITERATIONS)
 
         columns = np.zeros(horizontal_lines_img.shape[1], dtype=int)
 
@@ -340,7 +350,7 @@ def PixelConverter(orig_Image):
         return ONE_PIXEL_FALLBACK
 
 
-def ReduceColorPalette(image, nr_of_colors):
+def reduce_color_palette(image, nr_of_colors):
     image = image.copy()
 
     if image.ndim == 3:
@@ -381,7 +391,7 @@ def ReduceColorPalette(image, nr_of_colors):
     return out.reshape(image.shape)
 
 
-def Binarize(Image, tresh):
+def binarize(Image, tresh):
     if Image.ndim == 3:
         Image = rgb2gray(Image)
     else:
@@ -398,157 +408,7 @@ def Binarize(Image, tresh):
     return binarized
 
 
-def ComputeAdaptivePleuraThreshold(img, mode="normal"):
-    img_u = to_gray_uint8(img)
-
-    if img_u.size == 0:
-        return 245.0
-
-    values = img_u.reshape(-1).astype(np.float32)
-    values = values[np.isfinite(values)]
-
-    if len(values) == 0:
-        return 245.0
-
-    try:
-        yen_thr = float(threshold_yen(img_u))
-    except Exception:
-        yen_thr = float(np.percentile(values, 92))
-
-    if mode == "surplus":
-        percentile_thr = float(np.percentile(values, 95.0))
-        offset = 2.0
-    elif mode == "pathologic":
-        percentile_thr = float(np.percentile(values, 88.0))
-        offset = -3.0
-    else:
-        percentile_thr = float(np.percentile(values, 92.0))
-        offset = 0.0
-
-    low_guard = float(np.percentile(values, 72.0))
-    high_guard = float(np.percentile(values, 99.2))
-
-    threshold = 0.55 * yen_thr + 0.45 * percentile_thr + offset
-    threshold = max(low_guard, min(high_guard, threshold))
-
-
-    threshold = max(5.0, min(250.0, threshold))
-
-    return threshold
-
-
-def CleanFinalPleuraMask(mask, image_shape, mode="normal"):
-    if mask is None or mask.size == 0:
-        return mask
-
-    h, w = image_shape[:2]
-    mask_bin = (mask > 0).astype(np.uint8) * 255
-
-    if np.count_nonzero(mask_bin) < 5:
-        return mask_bin
-
-    if mode == "surplus":
-        open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
-        mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_OPEN, open_kernel)
-    elif mode == "pathologic":
-        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2))
-        mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, close_kernel)
-    else:
-        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 2))
-        mask_bin = cv2.morphologyEx(mask_bin, cv2.MORPH_CLOSE, close_kernel)
-
-    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        (mask_bin > 0).astype(np.uint8),
-        connectivity=8
-    )
-
-    if n_labels <= 1:
-        return mask_bin
-
-    candidates = []
-
-    for label in range(1, n_labels):
-        x = int(stats[label, cv2.CC_STAT_LEFT])
-        y = int(stats[label, cv2.CC_STAT_TOP])
-        bw = int(stats[label, cv2.CC_STAT_WIDTH])
-        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
-        area = int(stats[label, cv2.CC_STAT_AREA])
-
-        if area < 8:
-            continue
-
-        width_frac = bw / max(w, 1)
-        height_frac = bh / max(h, 1)
-        area_frac = area / max(h * w, 1)
-        aspect = bw / max(bh, 1)
-        y_center = (y + bh / 2.0) / max(h, 1)
-
-        if mode == "surplus":
-            min_width_frac = 0.020
-            max_height_frac = 0.22
-            max_area_frac = 0.12
-            min_aspect = 1.35
-            max_keep = 3
-        elif mode == "pathologic":
-            min_width_frac = 0.006
-            max_height_frac = 0.55
-            max_area_frac = 0.25
-            min_aspect = 0.45
-            max_keep = 10
-        else:
-            min_width_frac = 0.012
-            max_height_frac = 0.38
-            max_area_frac = 0.18
-            min_aspect = 0.75
-            max_keep = 5
-
-        if width_frac < min_width_frac:
-            continue
-
-        if height_frac > max_height_frac:
-            continue
-
-        if area_frac > max_area_frac:
-            continue
-
-        if aspect < min_aspect:
-            continue
-
-
-        y_score = 1.0
-        if y_center < 0.05 or y_center > 0.95:
-            y_score = 0.35
-
-        score = (
-            2.6 * min(1.0, width_frac / 0.55)
-            + 1.2 * min(1.0, aspect / 8.0)
-            + 0.7 * y_score
-            - 1.6 * height_frac
-            - 2.0 * area_frac
-        )
-
-        candidates.append((score, label, max_keep))
-
-    if len(candidates) == 0:
-
-        return mask_bin
-
-    candidates = sorted(candidates, key=lambda item: item[0], reverse=True)
-    max_keep = candidates[0][2]
-    keep_labels = [label for _, label, _ in candidates[:max_keep]]
-
-    cleaned = np.zeros_like(mask_bin)
-
-    for label in keep_labels:
-        cleaned[labels == label] = 255
-
-    if np.count_nonzero(cleaned) < 5:
-        return mask_bin
-
-    return cleaned
-
-
-def IdnetifyPoly(X_, Y_, order):
+def identify_poly(X_, Y_, order):
     X_ = np.asarray(X_, dtype=np.float64)
     Y_ = np.asarray(Y_, dtype=np.float64)
 
@@ -580,7 +440,7 @@ def IdnetifyPoly(X_, Y_, order):
         return p, fitted_X
 
 
-def Fit(pts, poly_line, deviation):
+def fit_points(pts, poly_line, deviation):
     point = []
 
     for p in pts:
@@ -592,11 +452,11 @@ def Fit(pts, poly_line, deviation):
     return point
 
 
-def Fit2(pts, poly_line, deviation, X, Y):
+def fit_points_with_clamp(pts, poly_line, deviation, X, Y):
     point = []
     X = []
     Y = []
-    max_dev = 300
+    max_dev = MAX_FIT_DEVIATION
 
     for p in pts:
         x_hat = poly_line(p.y)
@@ -619,11 +479,11 @@ def Fit2(pts, poly_line, deviation, X, Y):
     return point, X, Y
 
 
-def ComputeDistance(p1, p2):
+def compute_distance(p1, p2):
     return math.sqrt(((p1.x - p2.x) ** 2) + ((p1.y - p2.y) ** 2))
 
 
-def removeOutliers(points, outlierConstant):
+def remove_outliers(points, outlierConstant):
     if len(points) < 2:
         return np.zeros((0, 0))
 
@@ -632,7 +492,7 @@ def removeOutliers(points, outlierConstant):
     for i in range(0, len(points)):
         for j in range(0, len(points)):
             if i != j:
-                dist = int(ComputeDistance(points[i], points[j]))
+                dist = int(compute_distance(points[i], points[j]))
 
                 if dist <= outlierConstant:
                     matrx[i][j] = 1
@@ -640,7 +500,7 @@ def removeOutliers(points, outlierConstant):
     return matrx
 
 
-def ExtractContour(Image, points):
+def extract_contour(Image, points):
     if Image.ndim == 3:
         Image = cv2.cvtColor(Image, cv2.COLOR_RGB2GRAY)
 
@@ -654,7 +514,7 @@ def ExtractContour(Image, points):
                 break
 
 
-def ExtractConnectedComponents(distances, points):
+def extract_connected_components(distances, points):
     X_ = []
     Y_ = []
     pts = []
@@ -689,7 +549,7 @@ def ExtractConnectedComponents(distances, points):
     return pts, X_, Y_
 
 
-def ConnectedContour(ROI):
+def connected_contour(ROI):
     if ROI is False or ROI is None:
         return False
 
@@ -734,7 +594,7 @@ def ConnectedContour(ROI):
     return contours
 
 
-def FindAllContoursFromMask(mask):
+def find_all_contours_from_mask(mask):
     if mask is None or mask.size == 0:
         return []
 
@@ -752,7 +612,7 @@ def FindAllContoursFromMask(mask):
     return contours
 
 
-def ComponentStats(component):
+def component_stats(component):
     if component is False or component is None:
         return None
 
@@ -792,8 +652,8 @@ def ComponentStats(component):
     }
 
 
-def IsPleuraLikeComponent(component, principal_poly=None, image_shape=None, mode="normal"):
-    stats = ComponentStats(component)
+def is_pleura_like_component(component, principal_poly=None, image_shape=None, mode="normal"):
+    stats = component_stats(component)
 
     if stats is None:
         return False
@@ -862,8 +722,8 @@ def IsPleuraLikeComponent(component, principal_poly=None, image_shape=None, mode
     return True
 
 
-def IsPrincipalComponentPlausible(component, image_shape=None):
-    stats = ComponentStats(component)
+def is_principal_component_plausible(component, image_shape=None):
+    stats = component_stats(component)
 
     if stats is None:
         return False
@@ -893,42 +753,7 @@ def IsPrincipalComponentPlausible(component, image_shape=None):
     return True
 
 
-def FinalMaskLooksPlausible(mask, image_shape, mode="normal"):
-    if mask is None or mask.size == 0:
-        return False
-
-    ys, xs = np.where(mask > 0)
-
-    if len(xs) < 5:
-        return False
-
-    h, w = image_shape[:2]
-
-    width = np.max(xs) - np.min(xs) + 1
-    height = np.max(ys) - np.min(ys) + 1
-    area = np.count_nonzero(mask)
-
-    if width < 0.06 * w:
-        return False
-
-    if mode == "pathologic":
-        if height > 0.65 * h:
-            return False
-
-        if area > 0.45 * h * w:
-            return False
-
-    else:
-        if height > 0.48 * h:
-            return False
-
-        if area > 0.35 * h * w:
-            return False
-
-    return True
-
-
-def ComputeMaskMetrics(mask, image_shape):
+def compute_mask_metrics(mask, image_shape):
     h, w = image_shape[:2]
 
     metrics = {
@@ -1026,9 +851,9 @@ def ComputeMaskMetrics(mask, image_shape):
     return metrics
 
 
-def ScorePleuraResult(result, image_shape, mode):
+def score_pleura_result(result, image_shape, mode):
     mask = result["display_mask"]
-    m = ComputeMaskMetrics(mask, image_shape)
+    m = compute_mask_metrics(mask, image_shape)
 
     if not m["has_pixels"]:
         m["score"] = -999.0
@@ -1189,7 +1014,7 @@ def ScorePleuraResult(result, image_shape, mode):
     return score, m
 
 
-def RunAutomaticPleuraDetection(crop_Image_rgb, one_pixel=ONE_PIXEL_FALLBACK):
+def run_automatic_pleura_detection(crop_Image_rgb, one_pixel=ONE_PIXEL_FALLBACK):
     candidates = []
     mode_errors = []
 
@@ -1197,7 +1022,7 @@ def RunAutomaticPleuraDetection(crop_Image_rgb, one_pixel=ONE_PIXEL_FALLBACK):
         try:
             interpreted_Image = crop_Image_rgb.copy()
 
-            result = ExtractPleuralLine(
+            result = extract_pleural_line(
                 crop_Image_rgb,
                 interpreted_Image,
                 mode=mode,
@@ -1209,7 +1034,7 @@ def RunAutomaticPleuraDetection(crop_Image_rgb, one_pixel=ONE_PIXEL_FALLBACK):
             if final_contours is None or len(final_contours) == 0:
                 raise ValueError("Nu s-a extras niciun contur final in modul " + mode)
 
-            score, metrics = ScorePleuraResult(
+            score, metrics = score_pleura_result(
                 result,
                 crop_Image_rgb.shape,
                 mode
@@ -1242,30 +1067,30 @@ def RunAutomaticPleuraDetection(crop_Image_rgb, one_pixel=ONE_PIXEL_FALLBACK):
     return best, candidates, mode_errors
 
 
-def IdentifyPrincipalContour(img, deviation=50):
+def identify_principal_contour(img, deviation=DEFAULT_DEVIATION):
     points = []
 
-    ExtractContour(img, points)
+    extract_contour(img, points)
 
     if len(points) < 2:
-        raise ValueError("[IdentifyPrincipalContour] Prea putine puncte candidate.")
+        raise ValueError("[identify_principal_contour] Prea putine puncte candidate.")
 
-    distances = removeOutliers(points, deviation)
+    distances = remove_outliers(points, deviation)
 
-    pts, PX_, PY_ = ExtractConnectedComponents(distances, points)
+    pts, PX_, PY_ = extract_connected_components(distances, points)
 
     if len(PX_) < 2:
-        raise ValueError("[IdentifyPrincipalContour] Componenta principala prea mica.")
+        raise ValueError("[identify_principal_contour] Componenta principala prea mica.")
 
-    poly_line, PX_fit = IdnetifyPoly(PX_, PY_, 3)
+    poly_line, PX_fit = identify_poly(PX_, PY_, 3)
 
-    pleural_underline = Fit(pts, poly_line, deviation)
+    pleural_underline = fit_points(pts, poly_line, deviation)
 
     if len(pleural_underline) < 2:
         pleural_underline = pts
 
     if len(pleural_underline) < 2:
-        raise ValueError("[IdentifyPrincipalContour] Pleura principala invalida.")
+        raise ValueError("[identify_principal_contour] Pleura principala invalida.")
 
     for p in pleural_underline:
         x0 = int(p.x + 10)
@@ -1285,11 +1110,11 @@ def IdentifyPrincipalContour(img, deviation=50):
     Ymax = min(img.shape[1] - 1, Ymax)
 
     if Xmax <= Xmin or Ymax <= Ymin:
-        raise ValueError("[IdentifyPrincipalContour] ROI principala invalida.")
+        raise ValueError("[identify_principal_contour] ROI principala invalida.")
 
     ROI = img[Xmin:Xmax, Ymin:Ymax]
 
-    contours = ConnectedContour(ROI)
+    contours = connected_contour(ROI)
 
     PX = []
     PY = []
@@ -1315,14 +1140,14 @@ def IdentifyPrincipalContour(img, deviation=50):
         PX = [p.x for p in pts]
         PY = [p.y for p in pts]
 
-    pleura, PX_, PY_ = Fit2(pts, poly_line, 50, PX, PY)
+    pleura, PX_, PY_ = fit_points_with_clamp(pts, poly_line, DEFAULT_DEVIATION, PX, PY)
 
     if len(pleura) < 2:
         pleura = pts
         PX_ = [p.x for p in pleura]
         PY_ = [p.y for p in pleura]
 
-    poly_line2, PX_fit2 = IdnetifyPoly(PX_, PY_, 1)
+    poly_line2, PX_fit2 = identify_poly(PX_, PY_, 1)
 
     if len(PX_fit2) > 0:
         mean_x = float(np.mean(PX_fit2))
@@ -1341,25 +1166,25 @@ def IdentifyPrincipalContour(img, deviation=50):
     return ctr, PY_, poly_line2, pleura, retry
 
 
-def IdentifySecondaryContour(lateral_poly, img, minX, minY):
+def identify_secondary_contour(lateral_poly, img, minX, minY):
     points = []
 
-    ExtractContour(img, points)
+    extract_contour(img, points)
 
     if len(points) < 2:
         return False, False, False, False, 1
 
-    distances = removeOutliers(points, 50)
+    distances = remove_outliers(points, DEFAULT_DEVIATION)
 
-    pts, PX_, PY_ = ExtractConnectedComponents(distances, points)
+    pts, PX_, PY_ = extract_connected_components(distances, points)
 
     if len(PX_) < 2:
         return False, False, False, False, 1
 
-    poly_line, PX_fit = IdnetifyPoly(PX_, PY_, 3)
+    poly_line, PX_fit = identify_poly(PX_, PY_, 3)
 
-    deviation = 30
-    pleural_underline = Fit(pts, poly_line, deviation)
+    deviation = SECONDARY_INITIAL_DEVIATION
+    pleural_underline = fit_points(pts, poly_line, deviation)
 
     if len(pleural_underline) < 2:
         return False, False, False, False, 1
@@ -1386,7 +1211,7 @@ def IdentifySecondaryContour(lateral_poly, img, minX, minY):
 
     ROI = img[Xmin:Xmax, Ymin:Ymax]
 
-    contours = ConnectedContour(ROI)
+    contours = connected_contour(ROI)
 
     if contours is False:
         return False, False, False, False, 1
@@ -1412,8 +1237,8 @@ def IdentifySecondaryContour(lateral_poly, img, minX, minY):
                 PX.append(p.x)
                 PY.append(p.y)
 
-    deviation = 100
-    pleura, PX_, PY_ = Fit2(pts, lateral_poly, deviation, PX, PY)
+    deviation = SECONDARY_LATERAL_DEVIATION
+    pleura, PX_, PY_ = fit_points_with_clamp(pts, lateral_poly, deviation, PX, PY)
 
     if len(pleura) < 2:
         return False, False, False, False, 1
@@ -1428,8 +1253,8 @@ def IdentifySecondaryContour(lateral_poly, img, minX, minY):
     return ctr, PY_, PX_, pleura, 0
 
 
-def GetComponentBounds(component):
-    stats = ComponentStats(component)
+def get_component_bounds(component):
+    stats = component_stats(component)
 
     if stats is None:
         return None
@@ -1444,7 +1269,7 @@ def GetComponentBounds(component):
     }
 
 
-def GetEndpoint(component, side):
+def get_endpoint(component, side):
     pts = component.reshape(-1, 2)
 
     if len(pts) == 0:
@@ -1516,7 +1341,7 @@ def component_column_profile(component):
     }
 
 
-def DetectInterruptionCandidates(components, image_shape, one_pixel, mode="normal"):
+def detect_interruption_candidates(components, image_shape, one_pixel, mode="normal"):
     h, w = image_shape[:2]
 
     if len(components) < 2:
@@ -1525,14 +1350,14 @@ def DetectInterruptionCandidates(components, image_shape, one_pixel, mode="norma
     valid_components = []
 
     for comp in components:
-        bounds = GetComponentBounds(comp)
+        bounds = get_component_bounds(comp)
 
         if bounds is not None:
             valid_components.append(comp)
 
     valid_components = sorted(
         valid_components,
-        key=lambda c: GetComponentBounds(c)["min_x"]
+        key=lambda c: get_component_bounds(c)["min_x"]
     )
 
     candidates = []
@@ -1546,8 +1371,8 @@ def DetectInterruptionCandidates(components, image_shape, one_pixel, mode="norma
         left_comp = valid_components[i]
         right_comp = valid_components[i + 1]
 
-        left_end = GetEndpoint(left_comp, "right")
-        right_start = GetEndpoint(right_comp, "left")
+        left_end = get_endpoint(left_comp, "right")
+        right_start = get_endpoint(right_comp, "left")
 
         if left_end is None or right_start is None:
             continue
@@ -1588,7 +1413,7 @@ def DetectInterruptionCandidates(components, image_shape, one_pixel, mode="norma
     return candidates
 
 
-def DetectNoduleCandidates(components, image_shape, one_pixel, mode="normal"):
+def detect_nodule_candidates(components, image_shape, one_pixel, mode="normal"):
     h, w = image_shape[:2]
 
     candidates = []
@@ -1676,7 +1501,7 @@ def DetectNoduleCandidates(components, image_shape, one_pixel, mode="normal"):
     return candidates
 
 
-def BuildComponentMask(components, image_shape):
+def build_component_mask(components, image_shape):
     h, w = image_shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
 
@@ -1692,14 +1517,14 @@ def BuildComponentMask(components, image_shape):
     return mask
 
 
-def BuildDisplayPleuraMask(components, image_shape, mode="normal"):
+def build_display_pleura_mask(components, image_shape, mode="normal"):
     h, w = image_shape[:2]
-    mask = BuildComponentMask(components, image_shape)
+    mask = build_component_mask(components, image_shape)
 
     valid_components = []
 
     for comp in components:
-        bounds = GetComponentBounds(comp)
+        bounds = get_component_bounds(comp)
 
         if bounds is not None:
             valid_components.append(comp)
@@ -1709,7 +1534,7 @@ def BuildDisplayPleuraMask(components, image_shape, mode="normal"):
 
     valid_components = sorted(
         valid_components,
-        key=lambda c: GetComponentBounds(c)["min_x"]
+        key=lambda c: get_component_bounds(c)["min_x"]
     )
 
     if mode == "surplus":
@@ -1732,8 +1557,8 @@ def BuildDisplayPleuraMask(components, image_shape, mode="normal"):
         left_comp = valid_components[i]
         right_comp = valid_components[i + 1]
 
-        left_end = GetEndpoint(left_comp, "right")
-        right_start = GetEndpoint(right_comp, "left")
+        left_end = get_endpoint(left_comp, "right")
+        right_start = get_endpoint(right_comp, "left")
 
         if left_end is None or right_start is None:
             continue
@@ -1759,27 +1584,27 @@ def BuildDisplayPleuraMask(components, image_shape, mode="normal"):
     return mask
 
 
-def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=ONE_PIXEL_FALLBACK):
+def extract_pleural_line(orig_Image, interpreted_Image, mode="normal", one_pixel=ONE_PIXEL_FALLBACK):
     img = orig_Image.copy()
 
     if img.ndim == 3:
         img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-    nr_of_colors = 20
-    img = ReduceColorPalette(img, nr_of_colors)
+    nr_of_colors = PLEURA_COLOR_COUNT
+    img = reduce_color_palette(img, nr_of_colors)
 
 
-    tresh = np.max(img) - 10
-    img = Binarize(img, tresh)
+    tresh = np.max(img) - PLEURA_THRESHOLD_OFFSET
+    img = binarize(img, tresh)
     img = (1 - img).astype(np.uint8)
 
     left_contour_components = []
     right_contour_components = []
     accepted_components = []
 
-    PrincipalComponent, PYS, poly_line2, points, retry = IdentifyPrincipalContour(img, 50)
+    PrincipalComponent, PYS, poly_line2, points, retry = identify_principal_contour(img, DEFAULT_DEVIATION)
 
-    principal_ok = IsPrincipalComponentPlausible(
+    principal_ok = is_principal_component_plausible(
         PrincipalComponent,
         image_shape=img.shape
     )
@@ -1817,7 +1642,7 @@ def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=O
         minX = max(0, minX)
 
         maxX = img.shape[0] - 1
-        left_poly_line, _ = IdnetifyPoly(Ex, Ey, 3)
+        left_poly_line, _ = identify_poly(Ex, Ey, 3)
 
         newROI = img[minX:maxX, 0:Ymin]
 
@@ -1826,7 +1651,7 @@ def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=O
 
         while Ymin < last_Y and newROI.shape[1] > 20 and isEmpty == 0:
             if len(newROI) > 0:
-                NextComponent, PY_, PX_, points, isEmpty = IdentifySecondaryContour(
+                NextComponent, PY_, PX_, points, isEmpty = identify_secondary_contour(
                     left_poly_line,
                     newROI,
                     minX,
@@ -1836,7 +1661,7 @@ def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=O
                 break
 
             if isEmpty != 1:
-                is_good = IsPleuraLikeComponent(
+                is_good = is_pleura_like_component(
                     NextComponent,
                     principal_poly=poly_line2,
                     image_shape=img.shape,
@@ -1894,7 +1719,7 @@ def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=O
         minX = max(0, minX)
 
         maxX = img.shape[0] - 1
-        right_poly_line, _ = IdnetifyPoly(Ex, Ey, 3)
+        right_poly_line, _ = identify_poly(Ex, Ey, 3)
 
         newROI = img[minX:maxX, Ymax:img.shape[1] - 1]
 
@@ -1903,7 +1728,7 @@ def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=O
 
         while Ymax > last_Y and newROI.shape[1] > 20 and isEmpty == 0:
             if len(newROI) > 0:
-                NextComponent, PY_, PX_, points, isEmpty = IdentifySecondaryContour(
+                NextComponent, PY_, PX_, points, isEmpty = identify_secondary_contour(
                     right_poly_line,
                     newROI,
                     minX,
@@ -1913,7 +1738,7 @@ def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=O
                 break
 
             if isEmpty != 1:
-                is_good = IsPleuraLikeComponent(
+                is_good = is_pleura_like_component(
                     NextComponent,
                     principal_poly=poly_line2,
                     image_shape=img.shape,
@@ -1951,31 +1776,31 @@ def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=O
             else:
                 break
 
-    component_mask = BuildComponentMask(
+    component_mask = build_component_mask(
         accepted_components,
         interpreted_Image.shape[:2]
     )
 
-    display_mask = BuildDisplayPleuraMask(
+    display_mask = build_display_pleura_mask(
         accepted_components,
         interpreted_Image.shape[:2],
         mode=mode
     )
 
 
-    final_contours = FindAllContoursFromMask(display_mask)
+    final_contours = find_all_contours_from_mask(display_mask)
 
     if len(final_contours) == 0:
         final_contours = accepted_components
 
-    interruptions = DetectInterruptionCandidates(
+    interruptions = detect_interruption_candidates(
         accepted_components,
         interpreted_Image.shape[:2],
         one_pixel,
         mode=mode
     )
 
-    nodules = DetectNoduleCandidates(
+    nodules = detect_nodule_candidates(
         accepted_components,
         interpreted_Image.shape[:2],
         one_pixel,
@@ -1991,18 +1816,6 @@ def ExtractPleuralLine(orig_Image, interpreted_Image, mode="normal", one_pixel=O
         "interruptions": interruptions,
         "nodules": nodules
     }
-
-
-def draw_components_overlay(image_rgb, components):
-    out = image_rgb.copy()
-
-    for comp in components:
-        try:
-            cv2.drawContours(out, [comp], -1, (255, 0, 0), 1)
-        except Exception:
-            pass
-
-    return out
 
 
 def draw_final_overlay(image_rgb, final_contours):
@@ -2060,40 +1873,6 @@ def draw_diagnostic_overlay(image_rgb, final_contours, interruptions, nodules):
     return out
 
 
-def build_interruption_mask(shape, interruptions):
-    mask = np.zeros(shape[:2], dtype=np.uint8)
-
-    for item in interruptions:
-        cx = int(item["cx"])
-        cy = int(item["cy"])
-        r = max(5, int(item["gap_px"] / 2))
-
-        cv2.circle(mask, (cx, cy), r, 255, 2)
-
-    return mask
-
-
-def build_nodule_mask(shape, nodules):
-    mask = np.zeros(shape[:2], dtype=np.uint8)
-
-    for item in nodules:
-        cv2.rectangle(
-            mask,
-            (int(item["x1"]), int(item["y1"])),
-            (int(item["x2"]), int(item["y2"])),
-            255,
-            2
-        )
-
-    return mask
-
-
-def write_metrics_file(path, metrics):
-    with open(path, "w", encoding="utf-8") as f:
-        for key in sorted(metrics.keys()):
-            f.write(str(key) + "=" + str(metrics[key]) + "\n")
-
-
 def write_auto_mode_csv(path, rows):
     if len(rows) == 0:
         with open(path, "w", encoding="utf-8") as f:
@@ -2133,454 +1912,126 @@ def write_auto_mode_csv(path, rows):
             f.write(",".join(esc(row.get(k, "")) for k in keys) + "\n")
 
 
-def main():
-    all_contours_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_CONTOURS"))
-    all_diagnostic_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_DIAGNOSTIC"))
-    all_components_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_COMPONENTS"))
-    all_masks_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_MASKS"))
-    all_interruption_masks_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_INTERRUPTION_MASKS"))
-    all_nodule_masks_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_NODULE_MASKS"))
-    all_mode_results_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_MODE_RESULTS"))
-    suspect_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "SUSPECT_RESULTS"))
-    error_dir = ensure_dir(os.path.join(OUTPUT_ROOT, "ERRORS"))
-
-    success_count = 0
-    fail_count = 0
-    suspect_count = 0
-
-    failed_images = []
-    suspect_images = []
-
-    interruption_report = []
-    nodule_report = []
-    auto_mode_report = []
-
-
-    for idx in range(START_IDX, END_IDX + 1):
-        img_name = str(idx) + ".jpg"
-        img_path = os.path.join(INPUT_DIR, img_name)
-
-
-        if not os.path.exists(img_path):
-            fail_count += 1
-            failed_images.append((img_name, "Fisier inexistent"))
-            continue
-
-        try:
-            orig_Image = io.imread(img_path)
-
-            if orig_Image.ndim == 2:
-                orig_Image = cv2.cvtColor(orig_Image, cv2.COLOR_GRAY2RGB)
-            elif orig_Image.ndim == 3 and orig_Image.shape[2] == 4:
-                orig_Image = cv2.cvtColor(orig_Image, cv2.COLOR_RGBA2RGB)
-
-            try:
-                one_pixel = PixelConverter(orig_Image)
-            except Exception:
-                one_pixel = ONE_PIXEL_FALLBACK
-
-            crop_Image = CropBorder(orig_Image)
-
-            if crop_Image.ndim == 3:
-                crop_Image = cv2.cvtColor(crop_Image, cv2.COLOR_RGB2GRAY)
-
-            crop_Image_rgb = cv2.cvtColor(crop_Image, cv2.COLOR_GRAY2RGB)
-
-            best_candidate, all_candidates, mode_errors = RunAutomaticPleuraDetection(
-                crop_Image_rgb,
-                one_pixel=one_pixel
-            )
-
-            mode = best_candidate["mode"]
-            result = best_candidate["result"]
-            auto_score = best_candidate["score"]
-            auto_metrics = best_candidate["metrics"]
-
-            final_contours = result["final_contours"]
-            components = result["components"]
-            display_mask = result["display_mask"]
-            component_mask = result["component_mask"]
-            interruptions = result["interruptions"]
-            nodules = result["nodules"]
-
-            if final_contours is None or len(final_contours) == 0:
-                raise ValueError("Nu s-a extras niciun contur final.")
-
-
-            img_modes_dir = ensure_dir(
-                os.path.join(
-                    all_mode_results_dir,
-                    format(idx, "02d")
-                )
-            )
-
-            for cand in all_candidates:
-                cand_mode = cand["mode"]
-                cand_result = cand["result"]
-                cand_metrics = cand["metrics"]
-
-                cand_dir = ensure_dir(
-                    os.path.join(
-                        img_modes_dir,
-                        cand_mode
-                    )
-                )
-
-                cand_overlay = draw_final_overlay(
-                    crop_Image_rgb,
-                    cand_result["final_contours"]
-                )
-
-                cand_diagnostic = draw_diagnostic_overlay(
-                    crop_Image_rgb,
-                    cand_result["final_contours"],
-                    cand_result["interruptions"],
-                    cand_result["nodules"]
-                )
-
-                cand_components_overlay = draw_components_overlay(
-                    crop_Image_rgb,
-                    cand_result["components"]
-                )
-
-                save_rgb(
-                    os.path.join(cand_dir, "overlay.png"),
-                    cand_overlay
-                )
-
-                save_rgb(
-                    os.path.join(cand_dir, "diagnostic.png"),
-                    cand_diagnostic
-                )
-
-                save_rgb(
-                    os.path.join(cand_dir, "components.png"),
-                    cand_components_overlay
-                )
-
-                cv2.imwrite(
-                    os.path.join(cand_dir, "mask.png"),
-                    cand_result["display_mask"]
-                )
-
-                cv2.imwrite(
-                    os.path.join(cand_dir, "component_mask.png"),
-                    cand_result["component_mask"]
-                )
-
-                write_metrics_file(
-                    os.path.join(cand_dir, "metrics.txt"),
-                    cand_metrics
-                )
-
-            if len(mode_errors) > 0:
-                with open(os.path.join(img_modes_dir, "mode_errors.txt"), "w", encoding="utf-8") as f:
-                    for err in mode_errors:
-                        f.write("MODE: " + str(err["mode"]) + "\n")
-                        f.write("ERROR: " + str(err["error"]) + "\n")
-                        f.write(err["traceback"])
-                        f.write("\n" + "=" * 60 + "\n")
-
-
-            result_overlay = draw_final_overlay(
-                crop_Image_rgb,
-                final_contours
-            )
-
-            output_path = os.path.join(
-                all_contours_dir,
-                format(idx, "02d") + "_detected_pleura.png"
-            )
-
-            save_rgb(output_path, result_overlay)
-
-
-            diagnostic_overlay = draw_diagnostic_overlay(
-                crop_Image_rgb,
-                final_contours,
-                interruptions,
-                nodules
-            )
-
-            diagnostic_path = os.path.join(
-                all_diagnostic_dir,
-                format(idx, "02d") + "_diagnostic.png"
-            )
-
-            save_rgb(diagnostic_path, diagnostic_overlay)
-
-
-            components_overlay = draw_components_overlay(
-                crop_Image_rgb,
-                components
-            )
-
-            components_path = os.path.join(
-                all_components_dir,
-                format(idx, "02d") + "_components.png"
-            )
-
-            save_rgb(components_path, components_overlay)
-
-
-            mask_path = os.path.join(
-                all_masks_dir,
-                format(idx, "02d") + "_mask.png"
-            )
-
-            cv2.imwrite(mask_path, display_mask)
-
-
-            interruption_mask = build_interruption_mask(
-                crop_Image.shape,
-                interruptions
-            )
-
-            interruption_mask_path = os.path.join(
-                all_interruption_masks_dir,
-                format(idx, "02d") + "_interruptions.png"
-            )
-
-            cv2.imwrite(interruption_mask_path, interruption_mask)
-
-
-            nodule_mask = build_nodule_mask(
-                crop_Image.shape,
-                nodules
-            )
-
-            nodule_mask_path = os.path.join(
-                all_nodule_masks_dir,
-                format(idx, "02d") + "_nodules.png"
-            )
-
-            cv2.imwrite(nodule_mask_path, nodule_mask)
-
-
-            is_plausible = bool(auto_metrics["accepted"])
-
-            if auto_metrics["suspect"]:
-                is_plausible = False
-
-            if not is_plausible:
-                suspect_count += 1
-                suspect_images.append((img_name, "Contur suspect automat: " + str(auto_metrics["reason"])))
-
-                suspect_path = os.path.join(
-                    suspect_dir,
-                    format(idx, "02d") + "_suspect.png"
-                )
-
-                save_rgb(suspect_path, diagnostic_overlay)
-
-
-            for item in interruptions:
-                interruption_report.append(
-                    {
-                        "image": img_name,
-                        "gap_px": item["gap_px"],
-                        "gap_mm": item["gap_mm"],
-                        "cx": item["cx"],
-                        "cy": item["cy"]
-                    }
-                )
-
-            for item in nodules:
-                nodule_report.append(
-                    {
-                        "image": img_name,
-                        "width_px": item["width_px"],
-                        "width_mm": item["width_mm"],
-                        "cx": item["cx"],
-                        "cy": item["cy"],
-                        "max_thickness": item["max_thickness"]
-                    }
-                )
-
-            auto_mode_report.append(
-                {
-                    "image": img_name,
-                    "chosen_mode": mode,
-                    "score": auto_score,
-                    "accepted": auto_metrics["accepted"],
-                    "suspect": auto_metrics["suspect"],
-                    "reason": auto_metrics["reason"],
-                    "coverage": auto_metrics["coverage"],
-                    "width_frac": auto_metrics["width_frac"],
-                    "height_frac": auto_metrics["height_frac"],
-                    "area_frac": auto_metrics["area_frac"],
-                    "continuity": auto_metrics["continuity"],
-                    "y_center_frac": auto_metrics["y_center_frac"],
-                    "median_thickness": auto_metrics["median_thickness"],
-                    "thickness_iqr": auto_metrics["thickness_iqr"],
-                    "thickness_var_norm": auto_metrics["thickness_var_norm"],
-                    "components_count": auto_metrics["components_count"],
-                    "interruptions_count": auto_metrics["interruptions_count"],
-                    "nodules_count": auto_metrics["nodules_count"]
-                }
-            )
-
-            success_count += 1
-
-
-        except Exception as e:
-            fail_count += 1
-            failed_images.append((img_name, str(e)))
-
-
-            error_path = os.path.join(
-                error_dir,
-                format(idx, "02d") + "_error.txt"
-            )
-
-            with open(error_path, "w", encoding="utf-8") as f:
-                f.write("Imagine: " + img_name + "\n")
-                f.write("Eroare: " + str(e) + "\n\n")
-                f.write(traceback.format_exc())
-
-            continue
-
-
-    summary_path = os.path.join(OUTPUT_ROOT, "summary.txt")
-    interruption_report_path = os.path.join(OUTPUT_ROOT, "interruptions_report.txt")
-    nodule_report_path = os.path.join(OUTPUT_ROOT, "nodules_report.txt")
-    auto_mode_report_path = os.path.join(OUTPUT_ROOT, "auto_mode_report.txt")
-    auto_mode_csv_path = os.path.join(OUTPUT_ROOT, "auto_mode_report.csv")
-
-    write_auto_mode_csv(auto_mode_csv_path, auto_mode_report)
-
-    with open(auto_mode_report_path, "w", encoding="utf-8") as f:
-        f.write("MOD ALES AUTOMAT PER IMAGINE\n")
-        f.write("=" * 70 + "\n")
-        f.write("Moduri disponibile: " + str(AUTO_MODES) + "\n\n")
-
-        if len(auto_mode_report) == 0:
-            f.write("Nu exista rezultate automate.\n")
-        else:
-            for item in auto_mode_report:
-                f.write(
-                    "Imagine: "
-                    + str(item["image"])
-                    + " | mode="
-                    + str(item["chosen_mode"])
-                    + " | score={:.4f}".format(item["score"])
-                    + " | accepted="
-                    + str(item["accepted"])
-                    + " | suspect="
-                    + str(item["suspect"])
-                    + " | reason="
-                    + str(item["reason"])
-                    + " | coverage={:.4f}".format(item["coverage"])
-                    + " | area_frac={:.6f}".format(item["area_frac"])
-                    + " | height_frac={:.4f}".format(item["height_frac"])
-                    + " | components="
-                    + str(item["components_count"])
-                    + " | intreruperi="
-                    + str(item["interruptions_count"])
-                    + " | noduli="
-                    + str(item["nodules_count"])
-                    + "\n"
-                )
-
-    with open(interruption_report_path, "w", encoding="utf-8") as f:
-        f.write("INTRERUPERI CANDIDATE\n")
-        f.write("=" * 50 + "\n")
-
-        if len(interruption_report) == 0:
-            f.write("Nu s-au gasit intreruperi candidate.\n")
-        else:
-            for item in interruption_report:
-                f.write(
-                    "Imagine: "
-                    + str(item["image"])
-                    + " | gap_px="
-                    + str(item["gap_px"])
-                    + " | gap_mm={:.4f}".format(item["gap_mm"])
-                    + " | center=("
-                    + str(item["cx"])
-                    + ", "
-                    + str(item["cy"])
-                    + ")\n"
-                )
-
-    with open(nodule_report_path, "w", encoding="utf-8") as f:
-        f.write("NODULI CANDIDATI\n")
-        f.write("=" * 50 + "\n")
-
-        if len(nodule_report) == 0:
-            f.write("Nu s-au gasit noduli candidati.\n")
-        else:
-            for item in nodule_report:
-                f.write(
-                    "Imagine: "
-                    + str(item["image"])
-                    + " | width_px="
-                    + str(item["width_px"])
-                    + " | width_mm={:.4f}".format(item["width_mm"])
-                    + " | max_thickness="
-                    + str(item["max_thickness"])
-                    + " | center=("
-                    + str(item["cx"])
-                    + ", "
-                    + str(item["cy"])
-                    + ")\n"
-                )
-
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("BATCH PLEURA - MOD AUTOMAT FARA HARDCODARE\n")
+def load_image_rgb(img_path):
+    image = io.imread(img_path)
+
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+
+    if image.ndim == 3 and image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+
+    return image
+
+
+def prepare_crop_rgb(image):
+    crop = crop_border(image)
+
+    if crop.ndim == 3:
+        crop = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+
+    return crop, cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB)
+
+
+def get_one_pixel(image):
+    try:
+        return pixel_converter(image)
+    except Exception:
+        return ONE_PIXEL_FALLBACK
+
+
+def build_auto_mode_row(img_name, mode, score, metrics):
+    return {
+        "image": img_name,
+        "chosen_mode": mode,
+        "score": score,
+        "accepted": metrics.get("accepted", False),
+        "suspect": metrics.get("suspect", True),
+        "reason": metrics.get("reason", ""),
+        "coverage": metrics.get("coverage", 0.0),
+        "width_frac": metrics.get("width_frac", 0.0),
+        "height_frac": metrics.get("height_frac", 0.0),
+        "area_frac": metrics.get("area_frac", 0.0),
+        "continuity": metrics.get("continuity", 0.0),
+        "y_center_frac": metrics.get("y_center_frac", 0.0),
+        "median_thickness": metrics.get("median_thickness", 0.0),
+        "thickness_iqr": metrics.get("thickness_iqr", 0.0),
+        "thickness_var_norm": metrics.get("thickness_var_norm", 0.0),
+        "components_count": metrics.get("components_count", 0),
+        "interruptions_count": metrics.get("interruptions_count", 0),
+        "nodules_count": metrics.get("nodules_count", 0)
+    }
+
+
+def save_detection_outputs(idx, crop_rgb, result, output_dirs):
+    final_contours = result["final_contours"]
+    display_mask = result["display_mask"]
+    interruptions = result.get("interruptions", [])
+    nodules = result.get("nodules", [])
+    prefix = format(idx, "02d")
+
+    final_overlay = draw_final_overlay(crop_rgb, final_contours)
+    diagnostic_overlay = draw_diagnostic_overlay(
+        crop_rgb,
+        final_contours,
+        interruptions,
+        nodules
+    )
+
+    save_rgb(
+        os.path.join(output_dirs["contours"], prefix + "_detected_pleura.png"),
+        final_overlay
+    )
+
+    save_rgb(
+        os.path.join(output_dirs["diagnostic"], prefix + "_diagnostic.png"),
+        diagnostic_overlay
+    )
+
+    cv2.imwrite(
+        os.path.join(output_dirs["masks"], prefix + "_mask.png"),
+        display_mask
+    )
+
+    return diagnostic_overlay
+
+
+def write_error_file(error_dir, idx, img_name, error):
+    error_path = os.path.join(error_dir, format(idx, "02d") + "_error.txt")
+
+    with open(error_path, "w", encoding="utf-8") as f:
+        f.write("Imagine: " + img_name + "\n")
+        f.write("Eroare: " + str(error) + "\n\n")
+        f.write(traceback.format_exc())
+
+
+def write_summary_file(
+    path,
+    success_count,
+    fail_count,
+    suspect_count,
+    auto_mode_report,
+    failed_images,
+    suspect_images,
+    output_dirs,
+    auto_mode_csv_path
+):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("BATCH PLEURA - MOD AUTOMAT\n")
         f.write("=" * 50 + "\n")
         f.write("Interval imagini: " + str(START_IDX) + "-" + str(END_IDX) + "\n")
         f.write("Reusite: " + str(success_count) + "\n")
         f.write("Esuate: " + str(fail_count) + "\n")
-        f.write("Suspecte: " + str(suspect_count) + "\n")
-        f.write("Total intreruperi candidate: " + str(len(interruption_report)) + "\n")
-        f.write("Total noduli candidati: " + str(len(nodule_report)) + "\n\n")
+        f.write("Suspecte: " + str(suspect_count) + "\n\n")
 
-        f.write("Moduri automate folosite:\n")
-        f.write(str(AUTO_MODES) + "\n\n")
-
-        f.write("Folder contururi:\n")
-        f.write(all_contours_dir + "\n\n")
-
-        f.write("Folder diagnostic:\n")
-        f.write(all_diagnostic_dir + "\n\n")
-
-        f.write("Folder componente:\n")
-        f.write(all_components_dir + "\n\n")
-
-        f.write("Folder masti:\n")
-        f.write(all_masks_dir + "\n\n")
-
-        f.write("Folder masti intreruperi:\n")
-        f.write(all_interruption_masks_dir + "\n\n")
-
-        f.write("Folder masti noduli:\n")
-        f.write(all_nodule_masks_dir + "\n\n")
-
-        f.write("Folder toate modurile:\n")
-        f.write(all_mode_results_dir + "\n\n")
-
-        f.write("Folder suspecte:\n")
-        f.write(suspect_dir + "\n\n")
-
-        f.write("Folder erori:\n")
-        f.write(error_dir + "\n\n")
-
-
-        f.write("Raport mod automat TXT:\n")
-        f.write(auto_mode_report_path + "\n\n")
-
-        f.write("Raport mod automat CSV:\n")
-        f.write(auto_mode_csv_path + "\n\n")
-
-        f.write("Raport intreruperi:\n")
-        f.write(interruption_report_path + "\n\n")
-
-        f.write("Raport noduli:\n")
-        f.write(nodule_report_path + "\n\n")
+        f.write("Output contururi: " + output_dirs["contours"] + "\n")
+        f.write("Output diagnostic: " + output_dirs["diagnostic"] + "\n")
+        f.write("Output masti: " + output_dirs["masks"] + "\n")
+        f.write("Output suspecte: " + output_dirs["suspect"] + "\n")
+        f.write("Output erori: " + output_dirs["errors"] + "\n")
+        f.write("Raport CSV: " + auto_mode_csv_path + "\n\n")
 
         f.write("MOD ALES AUTOMAT PER IMAGINE:\n")
-
         for item in auto_mode_report:
             f.write(
                 "  "
@@ -2588,35 +2039,116 @@ def main():
                 + " | mode="
                 + str(item["chosen_mode"])
                 + " | score={:.4f}".format(item["score"])
-                + " | accepted="
-                + str(item["accepted"])
                 + " | suspect="
                 + str(item["suspect"])
                 + " | reason="
                 + str(item["reason"])
-                + " | coverage={:.4f}".format(item["coverage"])
-                + " | area_frac={:.6f}".format(item["area_frac"])
-                + " | height_frac={:.4f}".format(item["height_frac"])
-                + " | components="
-                + str(item["components_count"])
-                + " | intreruperi="
-                + str(item["interruptions_count"])
-                + " | noduli="
-                + str(item["nodules_count"])
                 + "\n"
             )
 
-        f.write("\n")
-
-        if len(failed_images) > 0:
-            f.write("Imagini esuate:\n")
+        if failed_images:
+            f.write("\nImagini esuate:\n")
             for name, err in failed_images:
                 f.write("  " + name + ": " + err + "\n")
 
-        if len(suspect_images) > 0:
+        if suspect_images:
             f.write("\nImagini suspecte:\n")
             for name, reason in suspect_images:
                 f.write("  " + name + ": " + reason + "\n")
+
+
+def main():
+    output_dirs = {
+        "contours": ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_CONTOURS")),
+        "diagnostic": ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_DIAGNOSTIC")),
+        "masks": ensure_dir(os.path.join(OUTPUT_ROOT, "ALL_MASKS")),
+        "suspect": ensure_dir(os.path.join(OUTPUT_ROOT, "SUSPECT_RESULTS")),
+        "errors": ensure_dir(os.path.join(OUTPUT_ROOT, "ERRORS"))
+    }
+
+    success_count = 0
+    fail_count = 0
+    suspect_count = 0
+
+    failed_images = []
+    suspect_images = []
+    auto_mode_report = []
+
+    total_images = END_IDX - START_IDX + 1
+
+    for idx in range(START_IDX, END_IDX + 1):
+        img_name = str(idx) + ".jpg"
+        img_path = os.path.join(INPUT_DIR, img_name)
+        current_image = idx - START_IDX + 1
+
+        print("\n[" + str(current_image) + "/" + str(total_images) + "] Procesez: " + img_name)
+
+        if not os.path.exists(img_path):
+            fail_count += 1
+            failed_images.append((img_name, "Fisier inexistent"))
+            continue
+
+        try:
+            original_image = load_image_rgb(img_path)
+            one_pixel = get_one_pixel(original_image)
+            _, crop_rgb = prepare_crop_rgb(original_image)
+
+            best_candidate, _, _ = run_automatic_pleura_detection(
+                crop_rgb,
+                one_pixel=one_pixel
+            )
+
+            mode = best_candidate["mode"]
+            result = best_candidate["result"]
+            auto_score = best_candidate["score"]
+            auto_metrics = best_candidate["metrics"]
+            final_contours = result.get("final_contours", [])
+
+            if final_contours is None or len(final_contours) == 0:
+                raise ValueError("Nu s-a extras niciun contur final.")
+
+            diagnostic_overlay = save_detection_outputs(
+                idx,
+                crop_rgb,
+                result,
+                output_dirs
+            )
+
+            auto_mode_report.append(
+                build_auto_mode_row(img_name, mode, auto_score, auto_metrics)
+            )
+
+            if auto_metrics.get("suspect", True) or not auto_metrics.get("accepted", False):
+                suspect_count += 1
+                reason = "Contur suspect automat: " + str(auto_metrics.get("reason", ""))
+                suspect_images.append((img_name, reason))
+                save_rgb(
+                    os.path.join(output_dirs["suspect"], format(idx, "02d") + "_suspect.png"),
+                    diagnostic_overlay
+                )
+
+            success_count += 1
+
+        except Exception as e:
+            fail_count += 1
+            failed_images.append((img_name, str(e)))
+            write_error_file(output_dirs["errors"], idx, img_name, e)
+
+    summary_path = os.path.join(OUTPUT_ROOT, "summary.txt")
+    auto_mode_csv_path = os.path.join(OUTPUT_ROOT, "auto_mode_report.csv")
+
+    write_auto_mode_csv(auto_mode_csv_path, auto_mode_report)
+    write_summary_file(
+        summary_path,
+        success_count,
+        fail_count,
+        suspect_count,
+        auto_mode_report,
+        failed_images,
+        suspect_images,
+        output_dirs,
+        auto_mode_csv_path
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,80 @@
+BATCH PLEURA - MOD AUTOMAT
+==================================================
+Interval imagini: 0-61
+Reusite: 62
+Esuate: 0
+Suspecte: 1
+
+Output contururi: C:\Facultate\AN4\Licenta\Licenta-Cod\DEBUG_OUT_AUTO_MODE\ALL_CONTOURS
+Output diagnostic: C:\Facultate\AN4\Licenta\Licenta-Cod\DEBUG_OUT_AUTO_MODE\ALL_DIAGNOSTIC
+Output masti: C:\Facultate\AN4\Licenta\Licenta-Cod\DEBUG_OUT_AUTO_MODE\ALL_MASKS
+Output suspecte: C:\Facultate\AN4\Licenta\Licenta-Cod\DEBUG_OUT_AUTO_MODE\SUSPECT_RESULTS
+Output erori: C:\Facultate\AN4\Licenta\Licenta-Cod\DEBUG_OUT_AUTO_MODE\ERRORS
+Raport CSV: C:\Facultate\AN4\Licenta\Licenta-Cod\DEBUG_OUT_AUTO_MODE\auto_mode_report.csv
+
+MOD ALES AUTOMAT PER IMAGINE:
+  0.jpg | mode=pathologic | score=8.3315 | suspect=False | reason=ok
+  1.jpg | mode=pathologic | score=8.8745 | suspect=False | reason=ok
+  2.jpg | mode=pathologic | score=9.0116 | suspect=False | reason=ok
+  3.jpg | mode=pathologic | score=8.3928 | suspect=False | reason=ok
+  4.jpg | mode=pathologic | score=8.8379 | suspect=False | reason=ok
+  5.jpg | mode=pathologic | score=8.3513 | suspect=False | reason=ok
+  6.jpg | mode=pathologic | score=10.1040 | suspect=False | reason=ok
+  7.jpg | mode=pathologic | score=10.3103 | suspect=False | reason=ok
+  8.jpg | mode=pathologic | score=8.9873 | suspect=False | reason=ok
+  9.jpg | mode=pathologic | score=9.2854 | suspect=False | reason=ok
+  10.jpg | mode=pathologic | score=9.2597 | suspect=False | reason=ok
+  11.jpg | mode=pathologic | score=9.2445 | suspect=False | reason=ok
+  12.jpg | mode=pathologic | score=8.8891 | suspect=False | reason=ok
+  13.jpg | mode=pathologic | score=8.0840 | suspect=False | reason=ok
+  14.jpg | mode=pathologic | score=7.7626 | suspect=False | reason=ok
+  15.jpg | mode=pathologic | score=7.0308 | suspect=False | reason=ok
+  16.jpg | mode=pathologic | score=8.5356 | suspect=False | reason=ok
+  17.jpg | mode=pathologic | score=8.8406 | suspect=False | reason=ok
+  18.jpg | mode=pathologic | score=8.0444 | suspect=False | reason=ok
+  19.jpg | mode=pathologic | score=7.7652 | suspect=False | reason=ok
+  20.jpg | mode=pathologic | score=8.0437 | suspect=False | reason=ok
+  21.jpg | mode=pathologic | score=8.0890 | suspect=False | reason=ok
+  22.jpg | mode=pathologic | score=8.2103 | suspect=False | reason=ok
+  23.jpg | mode=normal | score=7.7462 | suspect=False | reason=ok
+  24.jpg | mode=pathologic | score=8.2992 | suspect=False | reason=ok
+  25.jpg | mode=pathologic | score=7.1282 | suspect=True | reason=huge_height,too_tall
+  26.jpg | mode=pathologic | score=8.2560 | suspect=False | reason=ok
+  27.jpg | mode=pathologic | score=8.1148 | suspect=False | reason=ok
+  28.jpg | mode=pathologic | score=7.4546 | suspect=False | reason=ok
+  29.jpg | mode=pathologic | score=7.8936 | suspect=False | reason=ok
+  30.jpg | mode=pathologic | score=6.5187 | suspect=False | reason=ok
+  31.jpg | mode=pathologic | score=6.8705 | suspect=False | reason=ok
+  32.jpg | mode=pathologic | score=7.0705 | suspect=False | reason=ok
+  33.jpg | mode=pathologic | score=8.2522 | suspect=False | reason=ok
+  34.jpg | mode=pathologic | score=7.8568 | suspect=False | reason=ok
+  35.jpg | mode=pathologic | score=9.9417 | suspect=False | reason=ok
+  36.jpg | mode=pathologic | score=10.2106 | suspect=False | reason=ok
+  37.jpg | mode=pathologic | score=9.7127 | suspect=False | reason=ok
+  38.jpg | mode=pathologic | score=10.4210 | suspect=False | reason=ok
+  39.jpg | mode=pathologic | score=8.4306 | suspect=False | reason=ok
+  40.jpg | mode=pathologic | score=8.4142 | suspect=False | reason=ok
+  41.jpg | mode=pathologic | score=7.3387 | suspect=False | reason=ok
+  42.jpg | mode=pathologic | score=6.3600 | suspect=False | reason=ok
+  43.jpg | mode=pathologic | score=10.2088 | suspect=False | reason=ok
+  44.jpg | mode=pathologic | score=8.0560 | suspect=False | reason=ok
+  45.jpg | mode=pathologic | score=7.2165 | suspect=False | reason=ok
+  46.jpg | mode=pathologic | score=6.2522 | suspect=False | reason=ok
+  47.jpg | mode=pathologic | score=9.7764 | suspect=False | reason=ok
+  48.jpg | mode=pathologic | score=9.6966 | suspect=False | reason=ok
+  49.jpg | mode=pathologic | score=9.7204 | suspect=False | reason=ok
+  50.jpg | mode=pathologic | score=9.4087 | suspect=False | reason=ok
+  51.jpg | mode=pathologic | score=9.4244 | suspect=False | reason=ok
+  52.jpg | mode=pathologic | score=9.7337 | suspect=False | reason=ok
+  53.jpg | mode=pathologic | score=6.5200 | suspect=False | reason=ok
+  54.jpg | mode=pathologic | score=9.1099 | suspect=False | reason=ok
+  55.jpg | mode=pathologic | score=9.0048 | suspect=False | reason=ok
+  56.jpg | mode=normal | score=6.7380 | suspect=False | reason=ok
+  57.jpg | mode=normal | score=6.7380 | suspect=False | reason=ok
+  58.jpg | mode=pathologic | score=9.5311 | suspect=False | reason=ok
+  59.jpg | mode=pathologic | score=9.2822 | suspect=False | reason=ok
+  60.jpg | mode=pathologic | score=10.7266 | suspect=False | reason=ok
+  61.jpg | mode=pathologic | score=8.8123 | suspect=False | reason=ok
+
+Imagini suspecte:
+  25.jpg: Contur suspect automat: huge_height,too_tall
